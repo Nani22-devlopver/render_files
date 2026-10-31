@@ -1,0 +1,14 @@
+# DB + image storage are on Supabase (cloud). Only the app containers run locally.
+services:
+  backend:
+    build: ./backend
+    env_file: ./backend/.env
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend

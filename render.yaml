@@ -1,0 +1,50 @@
+# One-click deploy: Render Dashboard -> New -> Blueprint -> pick this repo.
+# Assumes the GitHub repo root contains backend/ and frontend/ (i.e. you pushed the stage3_hackathon folder's contents).
+# If your repo root is the parent of stage3_hackathon, change rootDir to stage3_hackathon/backend and stage3_hackathon/frontend.
+services:
+  - type: web
+    name: stage6-backend
+    runtime: python
+    region: singapore
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: patient-images
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CORS_ORIGINS
+        value: https://stage6-frontend.onrender.com
+      - key: SEED_ON_START
+        value: "true"
+      - key: SEED_DEMO_DATA
+        value: "true"
+      - key: AI_PROVIDER
+        value: auto
+      - key: OLLAMA_API_KEY
+        sync: false
+
+  - type: web
+    name: stage6-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    routes:
+      - type: rewrite
+        source: /api/*
+        destination: https://stage6-backend.onrender.com/*
+      - type: rewrite
+        source: /*
+        destination: /index.html
