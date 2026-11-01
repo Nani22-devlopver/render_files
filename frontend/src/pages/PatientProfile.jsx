@@ -11,6 +11,7 @@ export default function PatientProfile() {
   const [consents, setConsents] = useState([]);
   const [timeline, setTimeline] = useState([]);
   const [purpose, setPurpose] = useState("examination");
+  const [records, setRecords] = useState([]);
   const [screen, setScreen] = useState({ exam_notes: "", tobacco: "", symptoms: "", duration: "" });
   const [sid, setSid] = useState("");
   const [detail, setDetail] = useState(null);
@@ -34,6 +35,11 @@ export default function PatientProfile() {
     setConsents(await api(`/patients/${id}/consents`));
     const tl = await api(`/patients/${id}/timeline`);
     setTimeline(tl.events || []);
+    if (user.role === "medical_officer" || user.role === "specialist") {
+      // Full clinical records (notes, photos, AI feedback, signed reviews) for each screening of this patient.
+      const list = await api(`/screenings?patient_id=${id}`);
+      setRecords(await Promise.all(list.map((r) => api(`/screenings/${r.id}`).catch(() => null))).then((x) => x.filter(Boolean)));
+    }
   }
   useEffect(() => {
     load().catch((e) => setMsg(e.message));
@@ -226,6 +232,73 @@ export default function PatientProfile() {
                 </div>
               );
             })()}
+          </div>
+        </>
+      )}
+      {(user.role === "medical_officer" || user.role === "specialist") && (
+        <>
+          <div className="card">
+            <h3 style={{ marginTop: 0 }}>Patient details</h3>
+            <dl className="facts">
+              {[
+                ["Age / Sex", `${p.age ?? "—"} / ${p.sex || "—"}`],
+                ["Phone", p.phone],
+                ["Email", p.email],
+                ["Address", p.address],
+                ["Village", p.village],
+                ["Habitation", p.habitation],
+                ["Gram panchayat", p.gram_panchayat],
+                ["Mandal", p.mandal],
+                ["PHC", p.phc],
+                ["Facility", p.facility],
+                ["Tobacco use", p.tobacco_use],
+                ["Symptoms", p.symptoms],
+                ["Medical history", p.medical_history],
+                ["Registered", p.created_at ? new Date(p.created_at).toLocaleString() : ""],
+              ].filter(([, v]) => v).map(([k, v]) => <span key={k} style={{ display: "contents" }}><dt>{k}</dt><dd>{v}</dd></span>)}
+            </dl>
+            {consents.length > 0 && (
+              <>
+                <h4 style={{ marginBottom: 6 }}>Consents</h4>
+                <div className="facts">
+                  {consents.map((c) => <Pill key={c.id} kind={c.granted ? "ok" : "bad"}>{c.purpose} · {c.language}</Pill>)}
+                </div>
+              </>
+            )}
+          </div>
+          <div className="card">
+            <h3 style={{ marginTop: 0 }}>Screening records &amp; notes</h3>
+            {records.length === 0 ? <Empty icon="file" text="No screening records yet" /> : records.map((sel) => (
+              <div key={sel.id} style={{ borderTop: "1px solid var(--line)", paddingTop: 14, marginTop: 14 }}>
+                <div className="item-top">
+                  <b>Report · #{sel.id.slice(0, 8)}</b>
+                  {sel.status && <Pill>{sel.status.replace(/_/g, " ")}</Pill>}
+                </div>
+                <dl className="facts">
+                  {sel.symptoms && <><dt>Symptoms</dt><dd>{sel.symptoms}</dd></>}
+                  {sel.duration && <><dt>Duration</dt><dd>{sel.duration}</dd></>}
+                  {sel.tobacco && <><dt>Tobacco</dt><dd>{sel.tobacco}</dd></>}
+                  {sel.exam_notes && <><dt>Exam notes</dt><dd>{sel.exam_notes}</dd></>}
+                </dl>
+                {(sel.images || []).length > 0 && (
+                  <div className="row">
+                    {sel.images.map((im) => (
+                      <img key={im.id} className="photo" alt={im.view} src={`/api/screenings/${sel.id}/images/${im.id}/file?access_token=${getToken()}`} />
+                    ))}
+                  </div>
+                )}
+                {(sel.ai_analyses || []).length === 0 ? <p className="small">No AI analysis for this screening.</p> : (
+                  sel.ai_analyses.map((a) => <AiFeedback key={a.id} analysis={a} audience="clinician" />)
+                )}
+                {(sel.reviews || []).map((r) => (
+                  <div key={r.id} className="consent-box" style={{ marginTop: 10 }}>
+                    <b>Medical officer review</b> · {r.outcome} · AI agreement: {r.ai_agreement}
+                    <div>{r.finding}</div>
+                    <span className="small">Signed {new Date(r.signed_at).toLocaleString()}</span>
+                  </div>
+                ))}
+              </div>
+            ))}
           </div>
         </>
       )}

@@ -56,6 +56,7 @@ export function Shell({ children }) {
     ],
     specialist: [
       ["/referrals", t.referrals, "file"],
+      ["/patients", t.patients, "users"],
       ["/appointments", t.appointments, "cal"],
       ["/investigations", t.investigations, "flask"],
       ["/notifications", t.notifications, "bell"],

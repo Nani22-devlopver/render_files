@@ -405,6 +405,7 @@ def create_screening(
 def list_screenings(
     status: str | None = None,
     awaiting_review: bool = False,
+    patient_id: str | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ):
@@ -418,6 +419,8 @@ def list_screenings(
     if user.role == "navigator":
         raise HTTPException(403, "Navigators cannot list clinical screenings")
     q = db.query(Screening)
+    if patient_id:
+        q = q.filter(Screening.patient_id == patient_id)
     if status:
         q = q.filter(Screening.status == status)
     if awaiting_review:
