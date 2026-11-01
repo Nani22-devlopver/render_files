@@ -1341,6 +1341,99 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(require_roles(
     return payload
 
 
+def _group_count(db: Session, col) -> dict:
+    from sqlalchemy import func
+    return {(k or "unknown"): n for k, n in db.query(col, func.count()).group_by(col).all()}
+
+
+@router.get("/admin/monitoring")
+def admin_monitoring(db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
+    """Aggregated district monitoring. No identifiable patient data is returned."""
+    now = datetime.now(timezone.utc)
+    n_patients = db.query(Patient).count()
+    n_screen = db.query(Screening).count()
+    n_review = db.query(ClinicalReview).count()
+    n_ref = db.query(Referral).count()
+    n_appt_done = db.query(Appointment).filter(Appointment.status == "COMPLETED").count()
+    n_inv_done = db.query(Investigation).filter(Investigation.state == "CLINICIAN_REVIEWED").count()
+
+    funnel = [
+        {"stage": "Patients registered", "value": n_patients},
+        {"stage": "Screenings", "value": n_screen},
+        {"stage": "Clinical reviews", "value": n_review},
+        {"stage": "Referrals", "value": n_ref},
+        {"stage": "Appointments completed", "value": n_appt_done},
+        {"stage": "Investigations reviewed", "value": n_inv_done},
+    ]
+
+    pending_reviews = db.query(Screening).filter(Screening.status.in_(["SUBMITTED", "AWAITING_REVIEW", "PENDING_REVIEW"])).count()
+    alerts = [
+        {"label": "Screenings awaiting review", "value": pending_reviews, "kind": "warn"},
+        {"label": "Urgent referrals open", "value": db.query(Referral).filter(Referral.priority == "urgent", Referral.status != "CLOSED").count(), "kind": "bad"},
+        {"label": "Missed appointments", "value": db.query(Appointment).filter(Appointment.status == "MISSED").count(), "kind": "bad"},
+        {"label": "Appointments awaiting confirmation", "value": db.query(Appointment).filter(Appointment.status == "REQUESTED").count(), "kind": "warn"},
+        {"label": "Investigations pending", "value": db.query(Investigation).filter(Investigation.state != "CLINICIAN_REVIEWED").count(), "kind": "warn"},
+        {"label": "Navigation tasks open/overdue", "value": db.query(NavigationTask).filter(NavigationTask.status.in_(["OPEN", "OVERDUE"])).count(), "kind": "warn"},
+    ]
+
+    # 14-day screening trend
+    start = (now - timedelta(days=13)).replace(hour=0, minute=0, second=0, microsecond=0)
+    per_day: dict[str, int] = {}
+    for (created,) in db.query(Screening.created_at).filter(Screening.created_at >= start).all():
+        if created is None:
+            continue
+        key = created.date().isoformat()
+        per_day[key] = per_day.get(key, 0) + 1
+    trend = []
+    for i in range(14):
+        d = (start + timedelta(days=i)).date().isoformat()
+        trend.append({"date": d, "count": per_day.get(d, 0)})
+
+    from sqlalchemy import func
+    active_roles = {
+        r: n for r, n in
+        db.query(User.role, func.count()).filter(User.status == "active", User.role != "admin").group_by(User.role).all()
+    }
+    staff = {"by_role": active_roles, "pending": db.query(User).filter(User.status == "pending").count()}
+
+    # Area-wise (mandal) activity
+    areas: dict[str, dict] = {}
+    pmap = {}
+    for pid, mandal in db.query(Patient.id, Patient.mandal).all():
+        name = (mandal or "").strip() or "Unspecified"
+        pmap[pid] = name
+        areas.setdefault(name, {"area": name, "patients": 0, "screenings": 0, "referrals": 0})["patients"] += 1
+    for (pid,) in db.query(Screening.patient_id).all():
+        a = areas.get(pmap.get(pid, "Unspecified"))
+        if a:
+            a["screenings"] += 1
+    for (pid,) in db.query(Referral.patient_id).all():
+        a = areas.get(pmap.get(pid, "Unspecified"))
+        if a:
+            a["referrals"] += 1
+    by_area = sorted(areas.values(), key=lambda a: (-a["patients"], a["area"]))
+
+    payload = {
+        "funnel": funnel,
+        "alerts": alerts,
+        "trend": trend,
+        "staff": staff,
+        "by_area": by_area,
+        "screening_status": _group_count(db, Screening.status),
+        "referral_status": _group_count(db, Referral.status),
+        "referral_priority": _group_count(db, Referral.priority),
+        "appointment_status": _group_count(db, Appointment.status),
+        "investigation_state": _group_count(db, Investigation.state),
+        "navigation_status": _group_count(db, NavigationTask.status),
+        "ai_labels": _group_count(db, AiAnalysis.research_label),
+        "generated_at": now.isoformat(),
+        "note": "Aggregated programme indicators only. Admin accounts cannot open identifiable records.",
+    }
+    audit(db, user.id, "admin.monitoring.view", "admin:monitoring")
+    db.commit()
+    return payload
+
+
 @router.get("/audit")
 def list_audit(db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "medical_officer"))):
     rows = db.query(AuditEvent).order_by(AuditEvent.created_at.desc()).limit(500).all()

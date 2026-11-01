@@ -30,7 +30,51 @@ export function currentUser() {
   }
 }
 
+// ---- Global button loading indicator -------------------------------------
+// A request that starts right after a button click shows a spinner on that
+// button (and blocks double clicks) until the request finishes.
+let lastClick = { btn: null, t: 0 };
+const busyCount = new Map();
+
+if (typeof document !== "undefined") {
+  document.addEventListener(
+    "click",
+    (e) => {
+      const btn = e.target instanceof Element ? e.target.closest("button") : null;
+      lastClick = { btn: btn && !btn.disabled ? btn : null, t: Date.now() };
+    },
+    true
+  );
+}
+
+function trackRequest() {
+  const btn = lastClick.btn;
+  if (!btn || Date.now() - lastClick.t > 800 || !btn.isConnected) return () => {};
+  busyCount.set(btn, (busyCount.get(btn) || 0) + 1);
+  btn.setAttribute("data-loading", "1");
+  btn.setAttribute("aria-busy", "true");
+  return () => {
+    const n = (busyCount.get(btn) || 1) - 1;
+    if (n <= 0) {
+      busyCount.delete(btn);
+      btn.removeAttribute("data-loading");
+      btn.removeAttribute("aria-busy");
+    } else {
+      busyCount.set(btn, n);
+    }
+  };
+}
+
 export async function api(path, options = {}) {
+  const done = trackRequest();
+  try {
+    return await apiRequest(path, options);
+  } finally {
+    done();
+  }
+}
+
+async function apiRequest(path, options = {}) {
   const headers = { ...(options.headers || {}) };
   const token = getToken();
   if (token) headers.Authorization = `Bearer ${token}`;

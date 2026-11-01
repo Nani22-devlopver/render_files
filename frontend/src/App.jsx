@@ -18,12 +18,18 @@ import Notes from "./pages/Notes";
 import OfflinePage from "./pages/OfflinePage";
 import AdminPending from "./pages/AdminPending";
 import AdminUsers from "./pages/AdminUsers";
+import AdminMonitoring from "./pages/AdminMonitoring";
+
+// Logged-in users never see the login page (fixes Back/Previous returning to /login).
+function PublicOnly({ children }) {
+  return currentUser() ? <Navigate to="/" replace /> : children;
+}
 
 export default function App() {
   const user = currentUser();
   return (
     <Routes>
-      <Route path="/login" element={<Login />} />
+      <Route path="/login" element={<PublicOnly><Login /></PublicOnly>} />
       <Route path="/" element={<Guard><Home /></Guard>} />
       <Route path="/patients" element={<Guard roles={["health_worker", "medical_officer", "specialist"]}><Patients /></Guard>} />
       <Route path="/patients/:id" element={<Guard roles={["health_worker", "medical_officer", "specialist"]}><PatientProfile /></Guard>} />
@@ -37,6 +43,7 @@ export default function App() {
       <Route path="/dashboard" element={<Guard roles={["admin", "medical_officer"]}><Dashboard /></Guard>} />
       <Route path="/audit" element={<Guard roles={["admin", "medical_officer"]}><AuditPage /></Guard>} />
       <Route path="/admin/pending" element={<Guard roles={["admin"]}><AdminPending /></Guard>} />
+      <Route path="/admin/monitoring" element={<Guard roles={["admin"]}><AdminMonitoring /></Guard>} />
       <Route path="/admin/users" element={<Guard roles={["admin"]}><AdminUsers /></Guard>} />
       <Route path="/notifications" element={<Guard><Notes /></Guard>} />
       <Route path="/offline" element={<Guard roles={["health_worker"]}><OfflinePage /></Guard>} />

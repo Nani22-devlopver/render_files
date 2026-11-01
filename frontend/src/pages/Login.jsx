@@ -37,7 +37,7 @@ export default function Login() {
     try {
       const data = await api("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) });
       setSession(data.token, data.user);
-      nav("/");
+      nav("/", { replace: true });
     } catch (ex) {
       setErr(ex.message);
     } finally {
@@ -107,7 +107,7 @@ export default function Login() {
                   </div>
                   {ok && <p className="okmsg" style={{ marginTop: 12 }}>{ok}</p>}
                   {err && <p className="err" style={{ marginTop: 12 }}>{err}</p>}
-                  <button type="submit" style={{ width: "100%" }} disabled={busy}>{busy ? "…" : t.login}</button>
+                  <button type="submit" style={{ width: "100%" }} disabled={busy}>{t.login}</button>
                 </form>
                 <p className="small" style={{ marginTop: 12 }}>Demo: hw / mo / spec / nav / admin @demo.local — password Demo@123</p>
               </>
@@ -129,7 +129,7 @@ export default function Login() {
                   <input value={reg.assigned_facility} onChange={setR("assigned_facility")} placeholder="PHC G. Madugula" />
                   {ok && <p className="okmsg" style={{ marginTop: 12 }}>{ok}</p>}
                   {err && <p className="err" style={{ marginTop: 12 }}>{err}</p>}
-                  <button type="submit" style={{ width: "100%" }} disabled={busy}>{busy ? "…" : "Submit for approval"}</button>
+                  <button type="submit" style={{ width: "100%" }} disabled={busy}>Submit for approval</button>
                 </form>
               </>
             )}

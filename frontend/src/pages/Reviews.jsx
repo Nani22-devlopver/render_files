@@ -151,7 +151,7 @@ export default function Reviews() {
                     </select>
                   </div>
                 </div>
-                <button onClick={sign} disabled={busy || !finding.trim()} style={{ marginTop: 14 }}>{busy ? "…" : t.sign}</button>
+                <button onClick={sign} disabled={busy || !finding.trim()} style={{ marginTop: 14 }}>{t.sign}</button>
               </div>
             </>
           )}

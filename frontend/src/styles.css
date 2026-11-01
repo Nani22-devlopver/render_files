@@ -251,3 +251,9 @@ dl.facts dd{margin:0}
 }
 @media print{.banner,.sidebar,.topbar,.toasts,button{display:none!important}.card{box-shadow:none;border-color:#999}body{background:#fff}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* Loading spinner on any button while its request is in progress */
+button[data-loading]{pointer-events:none;opacity:.85;cursor:progress}
+button[data-loading]::before{content:"";width:14px;height:14px;flex:none;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:btn-spin .7s linear infinite}
+@keyframes btn-spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){button[data-loading]::before{animation-duration:1.6s}}

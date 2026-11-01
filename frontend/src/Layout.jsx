@@ -68,6 +68,7 @@ export function Shell({ children }) {
     ],
     admin: [
       ["/dashboard", t.dashboard, "chart"],
+      ["/admin/monitoring", "District monitoring", "chart"],
       ["/admin/pending", "Pending approvals", "check"],
       ["/admin/users", "Users", "users"],
       ["/audit", t.audit, "list"],
@@ -76,7 +77,7 @@ export function Shell({ children }) {
   };
   const doLogout = () => {
     clearSession();
-    nav("/login");
+    nav("/login", { replace: true });
   };
   const langSel = (
     <select value={lang} onChange={(e) => switchLang(e.target.value)} aria-label={t.language}>
