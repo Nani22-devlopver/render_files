@@ -77,6 +77,8 @@ export default function Appointments() {
                   <span>
                     <b>{a.kind === "video" ? "Video consultation" : "Hospital visit"}</b> · {slotLabel(a.slot)}
                     {a.kind === "video" && <> · <span className="role-chip">Google Meet</span></>}
+                    {a.hospital_name && <> · {a.hospital_name}, {a.hospital_mandal}</>}
+                    {a.specialist_name && <> · {a.specialist_name}</>}
                   </span>
                   <span>
                     <Pill>{a.status}</Pill>
@@ -85,13 +87,26 @@ export default function Appointments() {
                     )}
                   </span>
                 </div>
+                {a.patient_name && (
+                  <p className="small">
+                    Patient: <b>{a.patient_name}</b>{a.patient_phone && <> · {a.patient_phone}</>}{a.patient_address && <> · {a.patient_address}</>}
+                    {" "}| Specialist: {a.nav_specialist_name || "any available"}{a.nav_specialist_phone && <> · {a.nav_specialist_phone}</>}
+                    {a.nav_hospital_address && <> | {a.nav_hospital_name}: {a.nav_hospital_address}</>}
+                  </p>
+                )}
+                {a.cross_mandal && (
+                  <p className="small">Cross-mandal visit · {a.approval_status === "PENDING" ? "waiting for the medical officer" : a.approval_status.toLowerCase()}{a.cross_reason ? ` · ${a.cross_reason}` : ""}{a.approval_note ? ` · Officer: ${a.approval_note}` : ""}</p>
+                )}
+                {canManage && a.approval_status === "PENDING" && (
+                  <div className="row"><button className="secondary sm" onClick={() => patch(a.id, "CANCELLED")}>Withdraw request</button></div>
+                )}
                 {canManage && a.kind === "video" && !a.has_meet_link && (
                   <div className="row">
                     <input placeholder="Paste the Google Meet link" value={links[a.id] || ""} onChange={(e) => setLinks({ ...links, [a.id]: e.target.value })} />
                     <button className="sm" disabled={!links[a.id]} onClick={() => saveLink(a.id)}>Save link</button>
                   </div>
                 )}
-                {canManage && (
+                {canManage && a.approval_status !== "PENDING" && (
                   <>
                     <div className="row">
                       {["CONFIRMED", "COMPLETED", "MISSED", "CANCELLED"].map((s) => (

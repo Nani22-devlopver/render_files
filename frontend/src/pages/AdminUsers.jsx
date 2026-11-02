@@ -29,7 +29,20 @@ const METRIC_LABEL = {
   unassigned_tasks: "Unassigned tasks",
   audit_events: "Recorded actions",
 };
-const STATUS_KIND = { active: "ok", pending: "warn", rejected: "bad" };
+const ADMIN_TABS = [
+  ["admin", "District admins"],
+  ["super_admin", "Super admins"],
+];
+const STATUS_TABS = [
+  ["", "Any status"],
+  ["active", "Active"],
+  ["pending", "Pending"],
+  ["suspended", "Suspended"],
+  ["rejected", "Declined"],
+];
+const ROLE_NAME = { admin: "district admin", super_admin: "super admin" };
+const roleName = (r) => ROLE_NAME[r] || String(r).replace("_", " ");
+const STATUS_KIND = { active: "ok", pending: "warn", rejected: "bad", suspended: "bad" };
 
 export default function AdminUsers() {
   const [users, setUsers] = useState(null);
@@ -38,6 +51,11 @@ export default function AdminUsers() {
   const [sel, setSel] = useState(null);
   const [detail, setDetail] = useState(null);
   const [err, setErr] = useState("");
+  const [statusF, setStatusF] = useState("");
+  const [busy, setBusy] = useState(false);
+  const me = currentUser();
+  const isSuper = me?.role === "super_admin";
+  const roleTabs = isSuper ? [...ROLE_TABS, ...ADMIN_TABS] : ROLE_TABS;
 
   useEffect(() => {
     api("/admin/users").then(setUsers).catch((e) => { setErr(e.message); setUsers([]); });
@@ -53,17 +71,58 @@ export default function AdminUsers() {
     }
   }
 
+  function applyUpdated(u) {
+    setUsers((rows) => rows.map((r) => (r.id === u.id ? u : r)));
+    setDetail((d) => (d && d.user.id === u.id ? { ...d, user: u } : d));
+  }
+
+  async function suspend(u) {
+    const reason = window.prompt(`Suspend ${u.full_name}?\n\nThey will be signed out and unable to log in. Their account and all records stay saved.\n\nReason (optional):`, "");
+    if (reason === null) return;
+    setBusy(true);
+    setErr("");
+    try {
+      applyUpdated(await api(`/admin/users/${u.id}/suspend`, { method: "POST", body: JSON.stringify({ reason }) }));
+      toast(`${u.full_name} suspended`);
+      window.dispatchEvent(new Event("pending-changed"));
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function reactivate(u) {
+    setBusy(true);
+    setErr("");
+    try {
+      applyUpdated(await api(`/admin/users/${u.id}/reactivate`, { method: "POST" }));
+      toast(`${u.full_name} reactivated`);
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const counts = (users || []).reduce((m, u) => ({ ...m, [u.role]: (m[u.role] || 0) + 1 }), {});
-  const list = (users || []).filter((u) => (!role || u.role === role) && `${u.full_name} ${u.email}`.toLowerCase().includes(q.trim().toLowerCase()));
+  const list = (users || []).filter((u) => (!role || u.role === role) && (!statusF || u.status === statusF) && `${u.full_name} ${u.email}`.toLowerCase().includes(q.trim().toLowerCase()));
 
   return (
     <>
-      <PageHead title="Users" sub="All health workers, navigators, medical officers and specialists. Select one to see their work status." />
+      <PageHead title="Users" sub={isSuper ? "Every account, including district admins. Select one to see their work status, or to suspend / reactivate them." : "All health workers, navigators, medical officers and specialists. Select one to see their work status, or to suspend / reactivate them."} />
       {err && <p className="err">{err}</p>}
       <div className="demo-chips" style={{ marginBottom: 12 }}>
-        {ROLE_TABS.map(([k, l]) => (
+        {roleTabs.map(([k, l]) => (
           <button type="button" key={k || "all"} className={`chip ${role === k ? "on" : ""}`} onClick={() => setRole(k)}>
             {l} {users ? `(${k ? counts[k] || 0 : users.length})` : ""}
+          </button>
+        ))}
+      </div>
+      <div className="demo-chips" style={{ marginBottom: 12 }}>
+        {STATUS_TABS.map(([k, l]) => (
+          <button type="button" key={k || "any"} className={`chip ${statusF === k ? "on" : ""}`} onClick={() => setStatusF(k)}>
+            {l} {users ? `(${k ? users.filter((u) => u.status === k).length : users.length})` : ""}
           </button>
         ))}
       </div>
@@ -79,7 +138,7 @@ export default function AdminUsers() {
                 <li key={u.id}>
                   <button type="button" className={`rec ${sel === u.id ? "on" : ""}`} onClick={() => open(u)}>
                     <span className="avatar">{initials(u.full_name)}</span>
-                    <span className="rec-body"><b>{u.full_name}</b><span>{u.role.replace("_", " ")}</span></span>
+                    <span className="rec-body"><b>{u.full_name}</b><span>{roleName(u.role)}</span></span>
                     <Pill kind={STATUS_KIND[u.status]}>{u.status}</Pill>
                   </button>
                 </li>
@@ -101,11 +160,29 @@ export default function AdminUsers() {
                   <Pill kind={STATUS_KIND[detail.user.status]}>{detail.user.status}</Pill>
                 </div>
                 <dl className="facts">
-                  <dt>Designation</dt><dd style={{ textTransform: "capitalize" }}>{detail.user.role.replace("_", " ")}</dd>
+                  <dt>Designation</dt><dd style={{ textTransform: "capitalize" }}>{roleName(detail.user.role)}</dd>
                   <dt>Facility</dt><dd>{detail.user.assigned_facility}</dd>
+                  <dt>District</dt><dd>{detail.user.district || "—"}</dd>
+                  <dt>Mandal</dt><dd>{detail.user.mandal || "—"}</dd>
                   <dt>Registered</dt><dd>{detail.user.created_at ? new Date(detail.user.created_at).toLocaleString() : "—"}</dd>
                   <dt>Last activity</dt><dd>{detail.work.last_activity ? new Date(detail.work.last_activity).toLocaleString() : "No activity yet"}</dd>
                 </dl>
+                {detail.user.status === "suspended" && (
+                  <div className="suspend-note">
+                    Suspended {detail.user.suspended_at ? new Date(detail.user.suspended_at).toLocaleString() : ""}
+                    {detail.user.suspension_reason ? ` — ${detail.user.suspension_reason}` : ""}. Their data is kept; they cannot sign in.
+                  </div>
+                )}
+                {detail.user.id !== me?.id && (
+                  <div className="row" style={{ marginTop: 14 }}>
+                    {detail.user.status === "active" && (
+                      <button type="button" className="danger sm" disabled={busy} onClick={() => suspend(detail.user)}>Suspend user</button>
+                    )}
+                    {detail.user.status === "suspended" && (
+                      <button type="button" className="sm" disabled={busy} onClick={() => reactivate(detail.user)}>Reactivate user</button>
+                    )}
+                  </div>
+                )}
               </div>
               <div className="card">
                 <h3>Work status</h3>

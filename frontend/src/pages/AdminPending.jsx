@@ -47,7 +47,7 @@ export default function AdminPending() {
                     <span className="avatar">{initials(u.full_name)}</span>
                     <div>
                       <b>{u.full_name}</b>
-                      <span>{u.email} · {u.assigned_facility}</span>
+                      <span>{u.email} · {u.assigned_facility}{u.district ? ` · ${u.mandal || "—"}, ${u.district}` : ""}</span>
                     </div>
                   </div>
                   <span className="role-chip">{u.role.replace("_", " ")}</span>

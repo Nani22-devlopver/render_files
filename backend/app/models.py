@@ -24,7 +24,51 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(40), index=True)
     assigned_facility: Mapped[str] = mapped_column(String(120), default="PHC G. Madugula")
     status: Mapped[str] = mapped_column(String(20), default="active")
+    district: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    mandal: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    suspended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    suspension_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # specialists only: the hospital they are registered in (set by the district admin) + contact details
+    hospital_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    specialty: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class District(Base):
+    """Master list of districts, maintained by district admins / super admins."""
+    __tablename__ = "districts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Mandal(Base):
+    __tablename__ = "mandals"
+    __table_args__ = (UniqueConstraint("district_id", "name", name="uq_mandal_district_name"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    district_id: Mapped[str] = mapped_column(String(36), ForeignKey("districts.id"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Hospital(Base):
+    """Hospital that patients can be booked into. Added and managed by the medical officer."""
+    __tablename__ = "hospitals"
+    __table_args__ = (UniqueConstraint("district", "mandal", "name", name="uq_hospital_place_name"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    name: Mapped[str] = mapped_column(String(160), index=True)
+    district: Mapped[str] = mapped_column(String(120), index=True)
+    mandal: Mapped[str] = mapped_column(String(120), index=True)
+    address: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    contact_phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    contact_email: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    available: Mapped[bool] = mapped_column(Boolean, default=True)  # False = hidden from booking
+    created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Patient(Base):
@@ -39,6 +83,7 @@ class Patient(Base):
     village: Mapped[str | None] = mapped_column(String(120), nullable=True)
     habitation: Mapped[str | None] = mapped_column(String(120), nullable=True)
     gram_panchayat: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    district: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     mandal: Mapped[str | None] = mapped_column(String(120), nullable=True)
     phc: Mapped[str | None] = mapped_column(String(120), nullable=True)
     tobacco_use: Mapped[str | None] = mapped_column(String(80), nullable=True)
@@ -129,6 +174,13 @@ class Referral(Base):
     priority: Mapped[str] = mapped_column(String(20), default="routine")
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(40), default="OPEN")
+    # chosen by the medical officer: the hospital, and optionally one specialist there (blank = any specialist of that hospital)
+    hospital_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    specialist_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    # written by the specialist after the patient has been seen
+    specialist_analysis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    analysis_outcome: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    analysed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -143,6 +195,16 @@ class Appointment(Base):
     video_ref: Mapped[str | None] = mapped_column(String(160), nullable=True)
     video_provider: Mapped[str] = mapped_column(String(20), default="google_meet")
     video_url: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    # hospital chosen for the patient at booking time (physical visits)
+    hospital_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("hospitals.id"), nullable=True, index=True)
+    specialist_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    booked_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # cross-mandal: hospital is outside the patient's own mandal -> a medical officer must accept first
+    cross_mandal: Mapped[bool] = mapped_column(Boolean, default=False)
+    cross_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    approval_status: Mapped[str] = mapped_column(String(20), default="NOT_REQUIRED")  # NOT_REQUIRED | PENDING | APPROVED | REJECTED
+    approval_note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    decided_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     attendance_outcome: Mapped[str | None] = mapped_column(String(40), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -186,6 +248,11 @@ class Notification(Base):
     title: Mapped[str] = mapped_column(String(160))
     body: Mapped[str] = mapped_column(String(255))
     read: Mapped[bool] = mapped_column(Boolean, default=False)
+    # ref groups alerts about one thing ("appt:<id>", "xmandal:<id>", "user:<id>", "referral:<id>") so they can be cleared together
+    ref: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    # "info" alerts are cleared once their action is taken; "meet" alerts (video links) expire after the scheduled day
+    kind: Mapped[str] = mapped_column(String(12), default="info")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     # have data straight from the database without waiting for a health worker to create it.
     SEED_DEMO_DATA: bool = True
     PORT: int = 8000
+    # Bootstrap super admin, created on start-up when no super admin exists. CHANGE THE PASSWORD in production.
+    SUPER_ADMIN_EMAIL: str = "superadmin@demo.local"
+    SUPER_ADMIN_PASSWORD: str = "Demo@123"
+    SUPER_ADMIN_NAME: str = "Super Admin"
 
     # AI image analysis. AI_PROVIDER: "auto" (Ollama Cloud if OLLAMA_API_KEY is set, else mock),
     # "ollama" (always Ollama Cloud) or "mock" (offline demo adapter).

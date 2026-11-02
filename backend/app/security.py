@@ -19,8 +19,13 @@ ROLES = {
     "medical_officer",
     "specialist",
     "navigator",
-    "admin",
+    "admin",  # district admin
+    "super_admin",
 }
+
+# Roles that use the admin console. `admin` is the district admin; `super_admin` has every district-admin
+# privilege and can additionally add / alter / delete any data in the application.
+ADMIN_ROLES = ("admin", "super_admin")
 
 
 def hash_password(password: str) -> str:

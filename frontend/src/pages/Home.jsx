@@ -11,6 +11,7 @@ export default function Home() {
     specialist: "/referrals",
     navigator: "/navigator",
     admin: "/dashboard",
+    super_admin: "/dashboard",
   }[user?.role];
   return <Navigate to={dest || "/login"} replace />;
 }

@@ -1,6 +1,7 @@
 import { useEffect, useState, useMemo } from "react";
 import { Link, NavLink, Navigate, useNavigate, useParams } from "react-router-dom";
 import { api, clearSession, currentUser, enqueue, flushQueue, getQueue, getToken, newIdempotencyKey, setSession } from "../api";
+import { GeoSelect } from "../geo";
 import { useI18n, ICONS, Icon, initials, tone, Pill, toUploadable, AI_LABELS, URGENCY_KIND, URGENCY_TEXT, BulletList, AiFeedback, Empty, Loading, toast, Toasts, PageHead, slotLabel, localToSlot, slotToLocalInput, defaultSlotInput, weekdayLabel, isPast, DateTimePick } from "../common";
 
 export default function Reviews() {
@@ -15,6 +16,21 @@ export default function Reviews() {
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  // referral target: the medical officer picks an available hospital, then a specialist of it (or leaves "any available specialist")
+  const [geo, setGeo] = useState({ district: "", mandal: "" });
+  const [hospitals, setHospitals] = useState([]);
+  const [hospitalId, setHospitalId] = useState("");
+  const [specialists, setSpecialists] = useState([]);
+  const [specialistId, setSpecialistId] = useState("");
+  useEffect(() => {
+    if (!geo.district || !geo.mandal) { setHospitals([]); return; }
+    api(`/hospitals?district=${encodeURIComponent(geo.district)}&mandal=${encodeURIComponent(geo.mandal)}`).then(setHospitals).catch(() => setHospitals([]));
+  }, [geo.district, geo.mandal]);
+  useEffect(() => {
+    setSpecialistId("");
+    if (!hospitalId) { setSpecialists([]); return; }
+    api(`/specialists?hospital_id=${hospitalId}`).then(setSpecialists).catch(() => setSpecialists([]));
+  }, [hospitalId]);
 
   async function load() {
     try {
@@ -37,6 +53,9 @@ export default function Reviews() {
       setFinding(s.symptoms || s.exam_notes || "");
       setOutcome("refer");
       setAgree("deferred");
+      const row = (rows || []).find((x) => x.id === id) || {};
+      setGeo({ district: row.patient_district || "", mandal: row.patient_mandal || "" });
+      setHospitalId("");
     } catch (e) {
       setErr(e.message);
     } finally {
@@ -45,12 +64,16 @@ export default function Reviews() {
   }
 
   async function sign() {
-    setBusy(true);
     setErr("");
+    if (outcome === "refer" && !hospitalId) {
+      setErr("Select the hospital to refer the patient to.");
+      return;
+    }
+    setBusy(true);
     try {
       const r = await api("/reviews", { method: "POST", body: JSON.stringify({ screening_id: sel.id, finding, outcome, ai_agreement: agree }) });
       if (outcome === "refer") {
-        const ref = await api("/referrals", { method: "POST", body: JSON.stringify({ review_id: r.id, reason: finding }) });
+        const ref = await api("/referrals", { method: "POST", body: JSON.stringify({ review_id: r.id, reason: finding, hospital_id: hospitalId, specialist_id: specialistId || null }) });
         setMsg(`Signed. Referral ${ref.id.slice(0, 8)} created. ${ref.slip.en} / ${ref.slip.te}`);
       } else {
         setMsg("Signed without referral.");
@@ -151,6 +174,23 @@ export default function Reviews() {
                     </select>
                   </div>
                 </div>
+                {outcome === "refer" && (
+                  <div style={{ marginTop: 12 }}>
+                    <b>Refer to hospital</b>
+                    <p className="small">Choose from the hospitals and specialists registered by the district admin. Leave the specialist empty and any available specialist of that hospital can take the patient.</p>
+                    <GeoSelect district={geo.district} mandal={geo.mandal} onChange={(g) => { setGeo(g); setHospitalId(""); }} />
+                    <label>Hospital</label>
+                    <select value={hospitalId} onChange={(e) => setHospitalId(e.target.value)} disabled={!geo.mandal}>
+                      <option value="">{!geo.mandal ? "Select a mandal first" : hospitals.length ? "Select hospital" : "No hospitals listed in this mandal"}</option>
+                      {hospitals.map((h) => <option key={h.id} value={h.id}>{h.name}{h.address ? ` — ${h.address}` : ""}</option>)}
+                    </select>
+                    <label>Specialist (optional)</label>
+                    <select value={specialistId} onChange={(e) => setSpecialistId(e.target.value)} disabled={!hospitalId}>
+                      <option value="">{hospitalId && specialists.length === 0 ? "No specialist registered — hospital will be notified" : "Any available specialist at this hospital"}</option>
+                      {specialists.map((sp) => <option key={sp.id} value={sp.id}>{sp.full_name}{sp.specialty ? ` · ${sp.specialty}` : ""}</option>)}
+                    </select>
+                  </div>
+                )}
                 <button onClick={sign} disabled={busy || !finding.trim()} style={{ marginTop: 14 }}>{t.sign}</button>
               </div>
             </>

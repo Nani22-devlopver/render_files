@@ -1,13 +1,14 @@
 import { useEffect, useState, useMemo } from "react";
 import { Link, NavLink, Navigate, useNavigate, useParams } from "react-router-dom";
 import { api, clearSession, currentUser, enqueue, flushQueue, getQueue, getToken, newIdempotencyKey, setSession } from "../api";
+import { GeoSelect } from "../geo";
 import { useI18n, ICONS, Icon, initials, tone, Pill, toUploadable, AI_LABELS, URGENCY_KIND, URGENCY_TEXT, BulletList, AiFeedback, Empty, Loading, toast, Toasts, PageHead, slotLabel, localToSlot, slotToLocalInput, defaultSlotInput, weekdayLabel, isPast, DateTimePick } from "../common";
 
 const DESIGNATIONS = [
   ["health_worker", "Health worker"],
   ["navigator", "Navigator"],
   ["medical_officer", "Medical officer"],
-  ["specialist", "Specialist"],
+  ["specialist", "Specialist (doctor)"],
 ];
 
 export default function Login() {
@@ -20,8 +21,8 @@ export default function Login() {
   const [ok, setOk] = useState("");
   const [show, setShow] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [reg, setReg] = useState({ full_name: "", email: "", password: "", role: "health_worker", assigned_facility: "" });
-  const demos = [["hw", "Health worker"], ["mo", "Medical officer"], ["spec", "Specialist"], ["nav", "Navigator"], ["admin", "Admin"]];
+  const [reg, setReg] = useState({ full_name: "", email: "", password: "", role: "health_worker", assigned_facility: "", district: "", mandal: "", hospital_id: "", specialty: "", phone: "" });
+  const demos = [["hw", "Health worker"], ["mo", "Medical officer"], ["spec", "Specialist"], ["nav", "Navigator"], ["admin", "District admin"], ["superadmin", "Super admin"]];
 
   function switchMode(m) {
     setMode(m);
@@ -45,6 +46,12 @@ export default function Login() {
     }
   }
 
+  const [regHospitals, setRegHospitals] = useState([]);
+  useEffect(() => {
+    if (reg.role !== "specialist" || !reg.district || !reg.mandal) { setRegHospitals([]); return; }
+    api(`/public/hospitals?district=${encodeURIComponent(reg.district)}&mandal=${encodeURIComponent(reg.mandal)}`).then(setRegHospitals).catch(() => setRegHospitals([]));
+  }, [reg.role, reg.district, reg.mandal]);
+
   async function register(e) {
     e.preventDefault();
     setErr("");
@@ -55,7 +62,7 @@ export default function Login() {
       setOk(res.message);
       setEmail(reg.email);
       setPassword("");
-      setReg({ full_name: "", email: "", password: "", role: "health_worker", assigned_facility: "" });
+      setReg({ full_name: "", email: "", password: "", role: "health_worker", assigned_facility: "", district: "", mandal: "", hospital_id: "", specialty: "", phone: "" });
     } catch (ex) {
       setErr(ex.message);
     } finally {
@@ -109,7 +116,7 @@ export default function Login() {
                   {err && <p className="err" style={{ marginTop: 12 }}>{err}</p>}
                   <button type="submit" style={{ width: "100%" }} disabled={busy}>{t.login}</button>
                 </form>
-                <p className="small" style={{ marginTop: 12 }}>Demo: hw / mo / spec / nav / admin @demo.local — password Demo@123</p>
+                <p className="small" style={{ marginTop: 12 }}>Demo: hw / mo / spec / nav / admin / superadmin @demo.local — password Demo@123</p>
               </>
             ) : (
               <>
@@ -125,8 +132,25 @@ export default function Login() {
                   <select value={reg.role} onChange={setR("role")}>
                     {DESIGNATIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
                   </select>
-                  <label>Facility (optional)</label>
-                  <input value={reg.assigned_facility} onChange={setR("assigned_facility")} placeholder="PHC G. Madugula" />
+                  <GeoSelect district={reg.district} mandal={reg.mandal} onChange={(g) => setReg({ ...reg, ...g, hospital_id: "" })} />
+                  {reg.role === "specialist" ? (
+                    <>
+                      <label>Your hospital</label>
+                      <select value={reg.hospital_id} onChange={setR("hospital_id")} required disabled={!reg.mandal}>
+                        <option value="">{!reg.mandal ? "Select district and mandal first" : regHospitals.length ? "Select your hospital" : "No hospitals listed here. Ask the district admin to add yours"}</option>
+                        {regHospitals.map((h) => <option key={h.id} value={h.id}>{h.name}</option>)}
+                      </select>
+                      <label>Specialty (optional)</label>
+                      <input value={reg.specialty} onChange={setR("specialty")} placeholder="Oral surgery / ENT" />
+                      <label>Phone (optional)</label>
+                      <input value={reg.phone} onChange={setR("phone")} inputMode="tel" />
+                    </>
+                  ) : (
+                    <>
+                      <label>Facility (optional)</label>
+                      <input value={reg.assigned_facility} onChange={setR("assigned_facility")} placeholder="PHC G. Madugula" />
+                    </>
+                  )}
                   {ok && <p className="okmsg" style={{ marginTop: 12 }}>{ok}</p>}
                   {err && <p className="err" style={{ marginTop: 12 }}>{err}</p>}
                   <button type="submit" style={{ width: "100%" }} disabled={busy}>Submit for approval</button>

@@ -1,6 +1,7 @@
 import { useEffect, useState, useMemo } from "react";
 import { Link, NavLink, Navigate, useNavigate, useParams } from "react-router-dom";
 import { api, clearSession, currentUser, enqueue, flushQueue, getQueue, getToken, newIdempotencyKey, setSession } from "../api";
+import { GeoSelect } from "../geo";
 import { useI18n, ICONS, Icon, initials, tone, Pill, toUploadable, AI_LABELS, URGENCY_KIND, URGENCY_TEXT, BulletList, AiFeedback, Empty, Loading, toast, Toasts, PageHead, slotLabel, localToSlot, slotToLocalInput, defaultSlotInput, weekdayLabel, isPast, DateTimePick } from "../common";
 
 export default function Register() {
@@ -14,7 +15,8 @@ export default function Register() {
     village: "G. Madugula",
     habitation: "",
     gram_panchayat: "G. Madugula",
-    mandal: "G. Madugula",
+    district: currentUser()?.district || "",
+    mandal: currentUser()?.mandal || "",
     phc: "PHC G. Madugula",
     tobacco_use: "",
     symptoms: "",
@@ -75,10 +77,7 @@ export default function Register() {
             <label>{t.gram}</label>
             <input value={form.gram_panchayat} onChange={(e) => set("gram_panchayat", e.target.value)} />
           </div>
-          <div>
-            <label>{t.mandal}</label>
-            <input value={form.mandal} onChange={(e) => set("mandal", e.target.value)} />
-          </div>
+          <GeoSelect district={form.district} mandal={form.mandal} mandalLabel={t.mandal} onChange={(g) => setForm({ ...form, ...g })} />
           <div>
             <label>{t.phc}</label>
             <input value={form.phc} onChange={(e) => set("phc", e.target.value)} />

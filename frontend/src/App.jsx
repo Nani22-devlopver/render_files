@@ -19,32 +19,48 @@ import OfflinePage from "./pages/OfflinePage";
 import AdminPending from "./pages/AdminPending";
 import AdminUsers from "./pages/AdminUsers";
 import AdminMonitoring from "./pages/AdminMonitoring";
+import AdminGeography from "./pages/AdminGeography";
+import SuperUsers from "./pages/SuperUsers";
+import SuperData from "./pages/SuperData";
+import Hospitals from "./pages/Hospitals";
+import SpecialistDashboard from "./pages/SpecialistDashboard";
+import Specialists from "./pages/Specialists";
+import CrossMandal from "./pages/CrossMandal";
 
 // Logged-in users never see the login page (fixes Back/Previous returning to /login).
 function PublicOnly({ children }) {
   return currentUser() ? <Navigate to="/" replace /> : children;
 }
-
+// Read the role when this route renders (not when App first mounted), so it is right straight after login.
+function ReferralsByRole() {
+  return currentUser()?.role === "specialist" ? <SpecialistDashboard /> : <Referrals />;
+}
 export default function App() {
   const user = currentUser();
   return (
     <Routes>
       <Route path="/login" element={<PublicOnly><Login /></PublicOnly>} />
       <Route path="/" element={<Guard><Home /></Guard>} />
-      <Route path="/patients" element={<Guard roles={["health_worker", "medical_officer", "specialist"]}><Patients /></Guard>} />
-      <Route path="/patients/:id" element={<Guard roles={["health_worker", "medical_officer", "specialist"]}><PatientProfile /></Guard>} />
+      <Route path="/patients" element={<Guard roles={["health_worker", "medical_officer", "specialist", "super_admin"]}><Patients /></Guard>} />
+      <Route path="/patients/:id" element={<Guard roles={["health_worker", "medical_officer", "specialist", "super_admin"]}><PatientProfile /></Guard>} />
       <Route path="/register" element={<Guard roles={["health_worker"]}><Register /></Guard>} />
       <Route path="/reviews" element={<Guard roles={["medical_officer"]}><Reviews /></Guard>} />
-      <Route path="/referrals" element={<Guard roles={["specialist", "medical_officer", "navigator"]}><Referrals /></Guard>} />
+      <Route path="/referrals" element={<Guard roles={["specialist", "medical_officer", "navigator"]}><ReferralsByRole /></Guard>} />
       <Route path="/appointments" element={<Guard roles={["specialist", "navigator", "medical_officer", "health_worker"]}><Appointments /></Guard>} />
       <Route path="/video/:id" element={<Guard roles={["specialist", "health_worker", "medical_officer"]}><Video /></Guard>} />
       <Route path="/investigations" element={<Guard roles={["specialist", "medical_officer"]}><Investigations /></Guard>} />
       <Route path="/navigator" element={<Guard roles={["navigator"]}><NavigatorPage /></Guard>} />
-      <Route path="/dashboard" element={<Guard roles={["admin", "medical_officer"]}><Dashboard /></Guard>} />
-      <Route path="/audit" element={<Guard roles={["admin", "medical_officer"]}><AuditPage /></Guard>} />
-      <Route path="/admin/pending" element={<Guard roles={["admin"]}><AdminPending /></Guard>} />
-      <Route path="/admin/monitoring" element={<Guard roles={["admin"]}><AdminMonitoring /></Guard>} />
-      <Route path="/admin/users" element={<Guard roles={["admin"]}><AdminUsers /></Guard>} />
+      <Route path="/dashboard" element={<Guard roles={["admin", "super_admin", "medical_officer"]}><Dashboard /></Guard>} />
+      <Route path="/audit" element={<Guard roles={["admin", "super_admin", "medical_officer"]}><AuditPage /></Guard>} />
+      <Route path="/admin/pending" element={<Guard roles={["admin", "super_admin"]}><AdminPending /></Guard>} />
+      <Route path="/admin/monitoring" element={<Guard roles={["admin", "super_admin"]}><AdminMonitoring /></Guard>} />
+      <Route path="/admin/users" element={<Guard roles={["admin", "super_admin"]}><AdminUsers /></Guard>} />
+      <Route path="/admin/geography" element={<Guard roles={["admin", "super_admin"]}><AdminGeography /></Guard>} />
+      <Route path="/super/users" element={<Guard roles={["super_admin"]}><SuperUsers /></Guard>} />
+      <Route path="/super/data" element={<Guard roles={["super_admin"]}><SuperData /></Guard>} />
+      <Route path="/hospitals" element={<Guard roles={["admin", "super_admin"]}><Hospitals /></Guard>} />
+      <Route path="/specialists" element={<Guard roles={["admin", "super_admin"]}><Specialists /></Guard>} />
+      <Route path="/cross-mandal" element={<Guard roles={["medical_officer", "super_admin"]}><CrossMandal /></Guard>} />
       <Route path="/notifications" element={<Guard><Notes /></Guard>} />
       <Route path="/offline" element={<Guard roles={["health_worker"]}><OfflinePage /></Guard>} />
       <Route path="*" element={<Navigate to={user ? "/" : "/login"} />} />

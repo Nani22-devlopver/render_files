@@ -10,27 +10,63 @@ Bilingual (EN/TE) PWA + FastAPI workflow API + **Ollama Cloud vision analysis** 
 ## Folder structure
 
 ```
-aarogya-drishti/
-├── backend/                FastAPI + SQLAlchemy + PostgreSQL
+aarogya-drishti/   (stage14)
+├── backend/                         FastAPI + SQLAlchemy + PostgreSQL
 │   ├── app/
-│   │   ├── ai/             image-quality check + Ollama Cloud adapter + mock adapter
-│   │   ├── main.py  routers.py  models.py  db.py  config.py
-│   │   └── security.py  access.py  seed.py
-│   ├── scripts/test_ollama.py   quick Ollama Cloud check from the terminal
+│   │   ├── main.py  db.py  config.py  models.py  security.py  access.py
+│   │   ├── routers.py               patients, screenings, AI, reviews, referrals, appointments, navigation, notifications
+│   │   ├── hospital_routes.py       hospitals + specialists (district admin) and cross-mandal decisions (medical officer)
+│   │   ├── admin_routes.py          districts / mandals, super-admin user + data manager
+│   │   ├── geo.py  seed.py  supabase_storage.py
+│   │   └── ai/                      image-quality check, Ollama Cloud adapter, mock adapter
+│   ├── scripts/test_ollama.py
 │   ├── tests/test_api.py
-│   ├── requirements.txt  Dockerfile  init_db.sql  .env.example
-├── frontend/               React + Vite PWA
+│   ├── requirements.txt  Dockerfile  supabase_schema.sql  migrate_local_images.py  .env.example
+├── frontend/                        React + Vite PWA
 │   ├── src/
-│   │   ├── App.jsx         routes only
-│   │   ├── Layout.jsx      sidebar shell + role guard
-│   │   ├── common.jsx      shared helpers (icons, pills, toasts, AI feedback card)
-│   │   ├── api.js  i18n.js  styles.css
-│   │   └── pages/          one file per page (Login, Reviews, AuditPage, AdminPending, AdminUsers, ...)
-│   ├── public/  index.html  package.json  vite.config.js
+│   │   ├── App.jsx                  routes only
+│   │   ├── Layout.jsx               sidebar shell + role guard
+│   │   ├── common.jsx  geo.jsx  api.js  i18n.js  styles.css  main.jsx
+│   │   └── pages/                   SpecialistDashboard, Login, Register, Patients, PatientProfile, Reviews, Referrals, Appointments, Video,
+│   │                                Investigations, NavigatorPage, Hospitals, Specialists, CrossMandal, Dashboard,
+│   │                                AuditPage, Admin*, Super*, Notes, OfflinePage, Home
+│   ├── public/ (sw.js, manifest.json)  index.html  package.json  vite.config.js
 │   └── Dockerfile  nginx.conf
 ├── docs/DEMO_WALKTHROUGH.md
-└── docker-compose.yml
+├── SUPABASE_SETUP.md  render.yaml  docker-compose.yml
+└── README.md
 ```
+
+### Stage 14b — specialist self-registration with district-admin approval
+
+- The **Register** form offers *Specialist (doctor)*. After choosing district and mandal the applicant picks **their hospital from the list the district admin maintains** (`GET /public/hospitals`, no login needed), plus optional specialty and phone. The account is `pending` and cannot sign in.
+- The district admin approves or declines it under **Pending approvals** (the hospital shows there), or still adds specialists manually on the **Specialists** page (pending applicants also appear there as *Awaiting approval*, with an **Approve** button).
+
+### Stage 14 — specialist (doctor) dashboard
+
+The specialist now has a focused dashboard instead of the booking tools. Sidebar: **My patients** and **Notifications** only (Patients, Appointments and Investigations were removed from it).
+
+- **New requests**: patients the medical officer referred to this doctor (or to their hospital). **Accept patient** as a *direct visit* or a *video consult* (date/time, plus a Google Meet link for video). Accepting a hospital-level referral claims it, so colleagues no longer see it.
+- **Accepted**: **Reschedule** (everyone involved is notified), **Join call** for video, and **Update analysis**.
+- **Completed**: the saved analysis can be edited.
+- **Analysis after the visit**: `POST /referrals/{id}/analysis` (`analysis`, `outcome`: follow_up / treatment_started / biopsy_advised / referred_higher / no_issue). It marks the appointment completed and the referral `ASSESSED`, and tells the navigator, medical officer and health worker (no clinical text in the alert).
+- New columns (auto-added on start): `referrals.specialist_analysis`, `analysis_outcome`, `analysed_at`.
+- Navigators and medical officers keep the previous Referrals / Appointments pages.
+
+### Stage 13 — new privileges: hospital & specialist directory, targeted referrals, navigator hand-over
+
+| Role | What changed |
+|---|---|
+| **District admin** (`admin`, also super admin) | Adds, edits, hides and removes **hospitals** (*Hospitals* page) and registers / updates / deactivates the **specialists** of each hospital (*Specialists* page). A district admin tied to a district manages that district only. |
+| **Medical officer** | When signing a review with outcome *refer*, picks district → mandal → **hospital** (required) and optionally a **specialist** of that hospital. Leaving the specialist empty means any available specialist of that hospital can take the case. The MO no longer edits hospitals; he still decides cross-mandal requests. |
+| **Specialist** | A doctor registered in one hospital by the admin (no self-registration any more). Sees only patients promoted **to them** or **to their hospital with no named specialist**: referrals, patients, screenings, appointments, investigations and notifications are all filtered this way. |
+| **Navigator** | Each task / appointment now shows the **patient** (name, age, sex, phone, address) and the **specialist** (name, specialty, phone) plus the **hospital** (name, address, phone, mandal) and the appointment slot, so the patient can be guided and followed up. |
+
+- New columns (added automatically on start-up): `users.hospital_id / specialty / phone`, `referrals.hospital_id / specialist_id`.
+- New endpoints: `POST/PATCH/DELETE /specialists`, `GET /specialists?hospital_id=&district=&mandal=&include_inactive=`. `POST /referrals` now requires `hospital_id` (optional `specialist_id`). `POST/PATCH/DELETE /hospitals` are admin-only (the medical officer can list them).
+- Appointments booked from a referral default to the referral's hospital and specialist; a specialist must belong to the hospital chosen.
+- Demo data: `spec@demo.local` is registered at *Area Hospital Paderu*, a second specialist `spec2@demo.local` at *CHC G. Madugula*; existing referrals are linked to their hospital on start-up. Demo district admin: `admin@demo.local`.
+- Upgrading from stage 12: nothing to run by hand. Existing `specialist` accounts without a hospital only see referrals addressed to them personally until the admin assigns a hospital.
 
 ## Demo accounts (password `Demo@123`)
 
@@ -38,11 +74,45 @@ aarogya-drishti/
 | --- | --- |
 | Health worker | `hw@demo.local` |
 | Medical Officer | `mo@demo.local` |
-| Specialist | `spec@demo.local` |
+| Specialist (Area Hospital Paderu) | `spec@demo.local` |
+| Specialist (CHC G. Madugula) | `spec2@demo.local` |
 | Navigator | `nav@demo.local` |
 | District admin | `admin@demo.local` |
+| Super admin | `superadmin@demo.local` |
 
-New users can also register from the login page; an admin approves them under **Pending approvals**.
+New users can also register from the login page (they pick their **district** and **mandal** from the lists maintained by the admins); a district admin approves them under **Pending approvals**.
+
+### Stage 12 — hospitals, patient's hospital choice, cross-mandal approval, self-clearing notifications
+
+| Role | Responsibility |
+|---|---|
+| **Medical officer** (`medical_officer`, demo `mo@demo.local` / `Demo@123`) | Chooses the hospital / specialist when referring; accepts or declines cross-mandal bookings (hospitals are now managed by the district admin, see stage 13) |
+| **Patient** | Chooses district → mandal → hospital → specialist when booked. Patients have no login, so the booking team (navigator / medical officer / specialist) records the patient's choice |
+| **Specialist** | Treats the patient at the chosen hospital; never picks the hospital |
+| **Navigator** | Guides the patient to the hospital / department |
+
+- **Hospitals** (`/hospitals`): new `hospitals` table. Since stage 13 the district admin manages their own district; super admin manages all. A hospital that already has appointments can only be marked unavailable, not deleted.
+- **Booking** (Referrals → *Hospital slot*): pick district + mandal (starts at the patient's own mandal), then a hospital and optionally a specialist.
+- **Cross-mandal**: if the hospital is outside the patient's mandal, a written special reason is required and the appointment waits as `PENDING_APPROVAL`. The medical officer sees it under *Cross-mandal requests* (no patient name or clinical details) and accepts or declines (a reason is required to decline). Everyone involved is notified of the outcome.
+- **Notifications**: plain alerts clear once the action is taken (opening / *Done*, or when the request is answered: registration approved, cross-mandal decided, referral booked, appointment status changed). **Google Meet link alerts are never cleared by actions; they disappear after the scheduled day.** Ending or deleting a call still withdraws its alerts at once.
+- **Upgrading from stage 11:** nothing to run by hand. On start-up the backend creates the `hospitals` table, adds the new appointment / notification columns, seeds three demo hospitals (existing `health_officer` accounts become medical officers) (two in G. Madugula, one in Paderu).
+
+### Stage 11 — super admin, districts & mandals, suspension
+
+**District admin (`admin`)**
+- **District / mandal dashboards** — *Dashboard* and *District monitoring* have a district + mandal selector. Pick a district to see only its figures, then a mandal inside it. In monitoring, click a row of the district table (or mandal table) to drill down.
+- **Districts & mandals** (sidebar) — add districts and mandals by hand (one per line or comma-separated), rename or remove them. These lists feed the dropdowns on the user sign-up form and on patient registration. Renaming carries through to existing patient/staff records; a district or mandal that is still in use cannot be removed.
+- **Suspend users** — *Users* → select a person → **Suspend user** (with an optional reason). The person is signed out immediately and cannot log in, but the account and every record linked to it stay in the database unchanged. **Reactivate user** restores access.
+
+**Super admin (`super_admin`)** — everything a district admin can do, plus:
+- sees identifiable patient records (district admins only ever see aggregates);
+- **Users & admins** — add district admins (or any role) directly, edit any account, reset passwords, suspend / reactivate, or delete;
+- **Data manager** — view, add, edit and delete any row of any table (patients, screenings, referrals, districts, …) with search and paging; deleting a row that other records depend on asks for confirmation before a cascade delete. Every change is written to the audit trail;
+- the last active super admin cannot be suspended, demoted or deleted, and nobody can delete or demote themselves.
+
+The first super admin is created automatically on start-up (also on an existing database). Set `SUPER_ADMIN_EMAIL`, `SUPER_ADMIN_PASSWORD` and `SUPER_ADMIN_NAME` in `backend/.env` before going live — the default password is for the demo only.
+
+**Upgrading from stage 10:** nothing to run by hand. On start-up the backend creates the `districts` / `mandals` tables, adds the new `district`, `mandal` and suspension columns, seeds one starter district (*Alluri Sitharama Raju* → *G. Madugula*) and tags existing G. Madugula patients and demo staff with it. Add the rest of your districts and mandals from the admin console.
 
 ## Option A: Docker (easiest)
 
@@ -144,7 +214,7 @@ python -m pytest -q
 **Admin audit page (`/audit`)** is now a dashboard: KPI cards (total events, today, active users, sign-ins), search, category filters, a table with the user's name and role, and a "most frequent events" panel. `GET /audit` now returns `actor_name` and `actor_role` and the latest 500 events.
 
 **Self-registration with admin approval**
-- The login page has a **Sign in / Register** switch. Registering asks for name, email, password, **designation** (health worker, navigator, medical officer, specialist) and an optional facility.
+- The login page has a **Sign in / Register** switch. Registering asks for name, email, password, **designation** (health worker, navigator, medical officer, specialist; specialists choose their hospital and need district-admin approval) and an optional facility.
 - New accounts are saved with `status = pending`. They cannot sign in (login returns 403 with a clear message) until an admin approves them. Declined accounts also cannot sign in.
 - Every active admin gets a notification, and the **Pending approvals** page (sidebar badge shows the count) has Approve / Decline buttons. The user gets a notification of the decision.
 - Admins can only approve or decline a request once (second attempt returns 409). Demo seed users stay `active`.

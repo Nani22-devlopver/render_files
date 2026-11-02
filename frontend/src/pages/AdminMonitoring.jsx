@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { api } from "../api";
 import { Icon, Pill, Empty, Loading, PageHead } from "../common";
+import { GeoFilter, scopeQuery, scopeTitle } from "../geo";
 
 const nice = (k) => String(k).replace(/_/g, " ").toLowerCase();
 
@@ -39,22 +40,44 @@ function Trend({ points }) {
   );
 }
 
+function AreaTable({ rows, label, onPick }) {
+  if (!rows.length) return <Empty text="No area data yet" />;
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead><tr><th>{label}</th><th>Patients</th><th>Screenings</th><th>Referrals</th></tr></thead>
+        <tbody>
+          {rows.map((a) => {
+            const open = onPick && a.area !== "Unspecified";
+            return (
+              <tr key={a.area} className={open ? "pick" : ""} onClick={open ? () => onPick(a.area) : undefined}>
+                <td>{a.area}</td><td>{a.patients}</td><td>{a.screenings}</td><td>{a.referrals}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export default function AdminMonitoring() {
   const [d, setD] = useState(null);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  const [scope, setScope] = useState({ district: "", mandal: "" });
 
   const load = useCallback(async () => {
     setBusy(true);
     setErr("");
     try {
-      setD(await api("/admin/monitoring"));
+      setD(await api(`/admin/monitoring${scopeQuery(scope)}`));
     } catch (e) {
       setErr(e.message);
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [scope.district, scope.mandal]);
 
   useEffect(() => {
     load();
@@ -70,9 +93,10 @@ export default function AdminMonitoring() {
 
   return (
     <>
-      <PageHead title="District monitoring" sub={d.note}>
+      <PageHead title={scopeTitle(d.scope, "Monitoring")} sub={d.note}>
         <button className="secondary" onClick={load} disabled={busy}>Refresh</button>
       </PageHead>
+      <GeoFilter value={scope} onChange={setScope} />
       {err && <p className="err">{err}</p>}
 
       <div className="kpis">
@@ -102,25 +126,25 @@ export default function AdminMonitoring() {
               <span style={{ textTransform: "capitalize" }}>{nice(r)}</span><b>{n}</b>
             </div>
           )) : <p className="small">No active staff.</p>}
-          <p className="small" style={{ marginTop: 8 }}>Pending approvals: <b>{d.staff.pending}</b></p>
+          <p className="small" style={{ marginTop: 8 }}>Pending approvals: <b>{d.staff.pending}</b> · Suspended: <b>{d.staff.suspended}</b></p>
         </Panel>
       </div>
 
-      <div className="card" style={{ marginTop: 16 }}>
-        <h3 style={{ marginTop: 0 }}>Area-wise activity (by mandal)</h3>
-        {d.by_area.length ? (
-          <div className="table-wrap">
-            <table>
-              <thead><tr><th>Mandal</th><th>Patients</th><th>Screenings</th><th>Referrals</th></tr></thead>
-              <tbody>
-                {d.by_area.map((a) => (
-                  <tr key={a.area}><td>{a.area}</td><td>{a.patients}</td><td>{a.screenings}</td><td>{a.referrals}</td></tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : <Empty text="No area data yet" />}
-      </div>
+      {!scope.district && (
+        <div className="card" style={{ marginTop: 16 }}>
+          <h3 style={{ marginTop: 0 }}>District-wise activity</h3>
+          <p className="small">Select a row to open that district's dashboard.</p>
+          <AreaTable rows={d.by_district} label="District" onPick={(name) => setScope({ district: name, mandal: "" })} />
+        </div>
+      )}
+
+      {!scope.mandal && (
+        <div className="card" style={{ marginTop: 16 }}>
+          <h3 style={{ marginTop: 0 }}>Mandal-wise activity{scope.district ? ` — ${scope.district}` : ""}</h3>
+          {scope.district && <p className="small">Select a row to open that mandal's dashboard.</p>}
+          <AreaTable rows={d.by_area} label="Mandal" onPick={scope.district ? (name) => setScope({ district: scope.district, mandal: name }) : null} />
+        </div>
+      )}
 
       <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 16, marginTop: 16 }}>
         <Panel title="Screening status"><Bars data={d.screening_status} /></Panel>

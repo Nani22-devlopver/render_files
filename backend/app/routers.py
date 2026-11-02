@@ -9,17 +9,20 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.responses import Response
 from pydantic import BaseModel
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from .access import assert_patient_access, assert_screening_access, audit, get_patient_or_404, notify
+from .access import assert_patient_access, assert_screening_access, audit, clear_notifications, get_patient_or_404, notify, referral_visible, specialist_referral_filter
 from .config import settings
 from .db import get_db
+from .geo import GeoScope, clean, geo_tree, validate_geo
 from .models import (
     AiAnalysis,
     Appointment,
     AuditEvent,
     ClinicalReview,
     Consent,
+    Hospital,
     IdempotencyRecord,
     ImageRecord,
     Investigation,
@@ -31,7 +34,7 @@ from .models import (
     User,
     uid,
 )
-from .security import bearer, create_token, current_user, decode_token, hash_password, require_roles, verify_password
+from .security import ADMIN_ROLES, bearer, create_token, current_user, decode_token, hash_password, require_roles, verify_password
 
 from .ai.mock_adapter import analyze as mock_analyze
 from .ai.ollama_adapter import OllamaError, analyze as ollama_analyze
@@ -58,6 +61,7 @@ class PatientIn(BaseModel):
     village: str | None = None
     habitation: str | None = None
     gram_panchayat: str | None = None
+    district: str | None = None
     mandal: str | None = None
     phc: str | None = None
     tobacco_use: str | None = None
@@ -89,8 +93,10 @@ class ReviewIn(BaseModel):
 
 class ReferralIn(BaseModel):
     review_id: str
-    facility: str = "Area Hospital Paderu"
-    specialty: str = "Oral surgery / ENT"
+    hospital_id: str  # chosen by the medical officer from the list the district admin maintains
+    specialist_id: str | None = None  # optional: blank = any available specialist of that hospital
+    facility: str | None = None
+    specialty: str | None = None
     priority: str = "urgent"
     reason: str | None = None
 
@@ -102,6 +108,9 @@ class AppointmentIn(BaseModel):
     status: str = "REQUESTED"
     meet_url: str | None = None  # Google Meet link, required for video consultations
     start_now: bool = False  # specialists only: start the Meet immediately instead of scheduling
+    hospital_id: str | None = None  # physical visits: the hospital the patient chose (district -> mandal -> hospital)
+    specialist_id: str | None = None  # optional: the specialist the patient chose
+    cross_reason: str | None = None  # required when the hospital is outside the patient's own mandal
 
 
 class AppointmentPatch(BaseModel):
@@ -134,6 +143,15 @@ class RegisterIn(BaseModel):
     password: str
     role: str
     assigned_facility: str | None = None
+    district: str | None = None
+    mandal: str | None = None
+    hospital_id: str | None = None  # specialists: the hospital they work in (chosen from the admin's list)
+    specialty: str | None = None
+    phone: str | None = None
+
+
+class SuspendIn(BaseModel):
+    reason: str | None = None
 
 
 class AnalyzeIn(BaseModel):
@@ -149,6 +167,13 @@ def user_out(u: User) -> dict:
         "role": u.role,
         "assigned_facility": u.assigned_facility,
         "status": u.status,
+        "district": u.district,
+        "mandal": u.mandal,
+        "hospital_id": u.hospital_id,
+        "specialty": u.specialty,
+        "phone": u.phone,
+        "suspended_at": u.suspended_at.isoformat() if u.suspended_at else None,
+        "suspension_reason": u.suspension_reason,
         "created_at": u.created_at.isoformat() if u.created_at else None,
     }
 
@@ -165,6 +190,7 @@ def patient_out(p: Patient) -> dict:
         "village": p.village,
         "habitation": p.habitation,
         "gram_panchayat": p.gram_panchayat,
+        "district": p.district,
         "mandal": p.mandal,
         "phc": p.phc,
         "tobacco_use": p.tobacco_use,
@@ -208,6 +234,8 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
         raise HTTPException(403, "Your registration is awaiting admin approval. You can sign in once it is approved.")
     if user.status == "rejected":
         raise HTTPException(403, "Your registration was not approved. Please contact the district admin.")
+    if user.status == "suspended":
+        raise HTTPException(403, "Your account has been suspended. Please contact the district admin to restore access.")
     if user.status != "active":
         raise HTTPException(403, "This account is not active.")
     audit(db, user.id, "login", f"user:{user.id}")
@@ -215,7 +243,18 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
     return {"token": create_token(user), "user": user_out(user)}
 
 
-SELF_REGISTER_ROLES = {"health_worker", "navigator", "medical_officer", "specialist"}
+SELF_REGISTER_ROLES = {"health_worker", "navigator", "medical_officer", "specialist"}  # specialists pick their hospital; the district admin approves (or adds them on the Specialists page)
+
+
+@router.get("/public/hospitals")
+def public_hospitals(district: str | None = None, mandal: str | None = None, db: Session = Depends(get_db)):
+    """Hospital list for the registration form (no login yet): names and places only."""
+    q = db.query(Hospital).filter(Hospital.available.is_(True))
+    if clean(district):
+        q = q.filter(Hospital.district == clean(district))
+    if clean(mandal):
+        q = q.filter(Hospital.mandal == clean(mandal))
+    return [{"id": h.id, "name": h.name, "district": h.district, "mandal": h.mandal} for h in q.order_by(Hospital.name).all()]
 
 
 @router.post("/auth/register", status_code=201)
@@ -231,19 +270,33 @@ def register_account(body: RegisterIn, db: Session = Depends(get_db)):
         raise HTTPException(422, "Password must be at least 8 characters")
     if db.query(User).filter(User.email == email).first():
         raise HTTPException(409, "An account with this email already exists")
+    district, mandal = validate_geo(db, body.district, body.mandal)
+    facility = (body.assigned_facility or "").strip() or "PHC G. Madugula"
+    hospital_id = specialty = phone = None
+    if body.role == "specialist":
+        hospital = db.get(Hospital, body.hospital_id) if body.hospital_id else None
+        if not hospital or not hospital.available:
+            raise HTTPException(422, "Select the hospital you work in from the list")
+        hospital_id, facility, district, mandal = hospital.id, hospital.name, hospital.district, hospital.mandal
+        specialty, phone = clean(body.specialty), clean(body.phone)
     user = User(
         email=email,
         full_name=name,
         password_hash=hash_password(body.password),
         role=body.role,
-        assigned_facility=(body.assigned_facility or "").strip() or "PHC G. Madugula",
+        assigned_facility=facility,
+        district=district,
+        mandal=mandal,
+        hospital_id=hospital_id,
+        specialty=specialty,
+        phone=phone,
         status="pending",
     )
     db.add(user)
     db.flush()
     label = body.role.replace("_", " ")
-    for admin in db.query(User).filter(User.role == "admin", User.status == "active").all():
-        notify(db, admin.id, "New registration awaiting approval", f"{name} applied as {label}. Review it under Pending approvals.")
+    for admin in db.query(User).filter(User.role.in_(ADMIN_ROLES), User.status == "active").all():
+        notify(db, admin.id, "New registration awaiting approval", f"{name} applied as {label}. Review it under Pending approvals.", ref=f"user:{user.id}")
     audit(db, user.id, "user.register", f"user:{user.id}", json.dumps({"role": body.role}))
     db.commit()
     return {"ok": True, "status": "pending", "message": "Registration received. An admin must approve it before you can sign in."}
@@ -274,8 +327,13 @@ def create_patient(
             .filter(Patient.full_name == body.full_name, Patient.village == body.village)
             .first()
         )
+    district = clean(body.district) or user.district
+    mandal = clean(body.mandal) or (user.mandal if district == user.district else None)
+    district, mandal = validate_geo(db, district, mandal)
+    data = body.model_dump()
+    data["district"], data["mandal"] = district, mandal
     patient = Patient(
-        **body.model_dump(),
+        **data,
         created_by=user.id,
         facility=user.assigned_facility,
         duplicate_hint=f"Possible duplicate of {dup.id}" if dup else None,
@@ -299,6 +357,8 @@ def list_patients(q: str | None = None, db: Session = Depends(get_db), user: Use
         query = query.filter(Patient.facility == user.assigned_facility)
     if user.role in {"specialist", "navigator"}:
         referred = db.query(Referral.patient_id)
+        if user.role == "specialist":
+            referred = referred.filter(specialist_referral_filter(user))
         query = query.filter(Patient.id.in_(referred))
     if q:
         like = f"%{q}%"
@@ -430,7 +490,7 @@ def list_screenings(
         patients = db.query(Patient.id).filter(Patient.facility == user.assigned_facility)
         q = q.filter(Screening.patient_id.in_(patients))
     if user.role == "specialist":
-        referred = db.query(Referral.patient_id)
+        referred = db.query(Referral.patient_id).filter(specialist_referral_filter(user))
         q = q.filter(Screening.patient_id.in_(referred))
     rows = q.order_by(Screening.created_at.desc()).limit(200).all()
     patient_ids = {s.patient_id for s in rows}
@@ -442,6 +502,8 @@ def list_screenings(
             "patient_id": s.patient_id,
             "patient_name": people[s.patient_id].full_name if s.patient_id in people else None,
             "village": people[s.patient_id].village if s.patient_id in people else None,
+            "patient_district": people[s.patient_id].district if s.patient_id in people else None,
+            "patient_mandal": people[s.patient_id].mandal if s.patient_id in people else None,
             "status": s.status,
             "symptoms": s.symptoms,
             "tobacco": s.tobacco,
@@ -781,12 +843,24 @@ def create_referral(body: ReferralIn, db: Session = Depends(get_db), user: User 
     review = db.get(ClinicalReview, body.review_id)
     if not review:
         raise HTTPException(404, "Review not found")
+    hospital = db.get(Hospital, body.hospital_id)
+    if not hospital or not hospital.available:
+        raise HTTPException(422, "Select an available hospital for this referral")
+    specialist: User | None = None
+    if body.specialist_id:
+        specialist = db.get(User, body.specialist_id)
+        if not specialist or specialist.role != "specialist" or specialist.status != "active":
+            raise HTTPException(422, "Choose an active specialist")
+        if specialist.hospital_id != hospital.id:
+            raise HTTPException(422, "That specialist is not registered at the selected hospital")
     s = db.get(Screening, review.screening_id)
     rec = Referral(
         review_id=review.id,
         patient_id=s.patient_id,
-        facility=body.facility,
-        specialty=body.specialty,
+        facility=hospital.name,
+        hospital_id=hospital.id,
+        specialist_id=specialist.id if specialist else None,
+        specialty=(body.specialty or (specialist.specialty if specialist else None) or "Oral surgery / ENT"),
         priority=body.priority,
         reason=body.reason,
         created_by=user.id,
@@ -796,41 +870,92 @@ def create_referral(body: ReferralIn, db: Session = Depends(get_db), user: User 
     task = NavigationTask(referral_id=rec.id, status="OPEN", due="7d")
     db.add(task)
     s.status = "REFERRAL_PLANNED"
-    nav = db.query(User).filter(User.role == "navigator").first()
-    spec = db.query(User).filter(User.role == "specialist").first()
-    if nav:
-        notify(db, nav.id, "New referral", "A referral needs navigation follow-up.")
-    if spec:
-        notify(db, spec.id, "New referred case", "A synthetic referred case is waiting.")
-    audit(db, user.id, "referral.create", f"referral:{rec.id}")
+    for nav in db.query(User).filter(User.role == "navigator", User.status == "active").all():
+        notify(db, nav.id, "New referral", f"A patient was referred to {hospital.name}. Guide them to the hospital.", ref=f"referral:{rec.id}")
+    targets = [specialist] if specialist else db.query(User).filter(User.role == "specialist", User.status == "active", User.hospital_id == hospital.id).all()
+    for sp in targets:
+        notify(db, sp.id, "New referred case", f"A patient was referred to you at {hospital.name}.", ref=f"referral:{rec.id}")
+    audit(db, user.id, "referral.create", f"referral:{rec.id}", json.dumps({"hospital": hospital.id, "specialist": specialist.id if specialist else None}))
     db.commit()
-    return {
-        "id": rec.id,
-        "patient_id": rec.patient_id,
-        "facility": rec.facility,
-        "specialty": rec.specialty,
-        "priority": rec.priority,
-        "status": rec.status,
-        "slip": {
-            "en": f"Referral {rec.id[:8]} to {rec.facility} ({rec.specialty}). Priority: {rec.priority}.",
-            "te": f"రెఫరల్ {rec.id[:8]} — {rec.facility} ({rec.specialty}). ప్రాధాన్యం: {rec.priority}.",
-        },
-    }
+    return referral_out(rec, db.get(Patient, rec.patient_id), db)
 
 
-def referral_out(r: Referral, patient: Patient | None = None) -> dict:
+def _active_appointment(db: Session | None, referral_id: str) -> dict | None:
+    if not db:
+        return None
+    a = (
+        db.query(Appointment)
+        .filter(Appointment.referral_id == referral_id, Appointment.status != "CANCELLED")
+        .order_by(Appointment.created_at.desc())
+        .first()
+    )
+    if not a:
+        return None
+    return {"id": a.id, "kind": a.kind, "slot": a.slot, "status": a.status, "has_meet_link": bool(a.video_url), "approval_status": a.approval_status or "NOT_REQUIRED"}
+
+
+class AnalysisIn(BaseModel):
+    analysis: str
+    outcome: str = "follow_up"
+
+
+@router.post("/referrals/{referral_id}/analysis")
+def save_analysis(referral_id: str, body: AnalysisIn, db: Session = Depends(get_db), user: User = Depends(require_roles("specialist"))):
+    """The specialist records their analysis after the patient has visited (or had the video consult)."""
+    ref = db.get(Referral, referral_id)
+    if not ref or not referral_visible(user, ref):
+        raise HTTPException(404, "Referral not found")
+    if ref.specialist_id and ref.specialist_id != user.id:
+        raise HTTPException(403, "This patient was accepted by another specialist")
+    if body.outcome not in {"treatment_started", "biopsy_advised", "follow_up", "no_issue", "referred_higher"}:
+        raise HTTPException(422, "Choose an outcome")
+    text_ = (body.analysis or "").strip()
+    if len(text_) < 5:
+        raise HTTPException(422, "Write your analysis of the patient")
+    appt = db.query(Appointment).filter(Appointment.referral_id == ref.id, Appointment.status != "CANCELLED").order_by(Appointment.created_at.desc()).first()
+    if not appt:
+        raise HTTPException(409, "Accept the patient (hospital visit or video consult) before recording the analysis")
+    ref.specialist_id = ref.specialist_id or user.id
+    ref.specialist_analysis, ref.analysis_outcome, ref.analysed_at, ref.status = text_, body.outcome, datetime.now(timezone.utc), "ASSESSED"
+    if appt.status != "COMPLETED":
+        appt.status = "COMPLETED"
+        notify_appointment(db, appt, user, "Specialist consultation completed", "The specialist has recorded the analysis. No clinical details included.", roles={"health_worker", "medical_officer", "navigator"})
+    clear_notifications(db, f"referral:{ref.id}")
+    audit(db, user.id, "referral.analysis", f"referral:{ref.id}", body.outcome)
+    db.commit()
+    return referral_out(ref, db.get(Patient, ref.patient_id), db)
+
+
+def referral_out(r: Referral, patient: Patient | None = None, db: Session | None = None) -> dict:
     name = patient.full_name if patient else None
     village = patient.village if patient else None
+    hospital = db.get(Hospital, r.hospital_id) if db and r.hospital_id else None
+    specialist = db.get(User, r.specialist_id) if db and r.specialist_id else None
     return {
         "id": r.id,
         "patient_id": r.patient_id,
         "patient_name": name,
         "village": village,
+        "district": patient.district if patient else None,
+        "mandal": patient.mandal if patient else None,
         "facility": r.facility,
+        "hospital_id": r.hospital_id,
+        "hospital_name": hospital.name if hospital else r.facility,
+        "hospital_mandal": hospital.mandal if hospital else None,
+        "hospital_district": hospital.district if hospital else None,
+        "specialist_id": r.specialist_id,
+        "specialist_name": specialist.full_name if specialist else None,
         "specialty": r.specialty,
         "priority": r.priority,
         "status": r.status,
         "reason": r.reason,
+        "patient_age": patient.age if patient else None,
+        "patient_sex": patient.sex if patient else None,
+        "patient_symptoms": patient.symptoms if patient else None,
+        "specialist_analysis": r.specialist_analysis,
+        "analysis_outcome": r.analysis_outcome,
+        "analysed_at": r.analysed_at.isoformat() if r.analysed_at else None,
+        "appointment": _active_appointment(db, r.id),
         "slip": {
             "en": f"Referral {r.id[:8]} to {r.facility} ({r.specialty}). Priority: {r.priority}.",
             "te": f"రెఫరల్ {r.id[:8]} — {r.facility} ({r.specialty}). ప్రాధాన్యం: {r.priority}.",
@@ -839,21 +964,22 @@ def referral_out(r: Referral, patient: Patient | None = None) -> dict:
 
 
 @router.get("/referrals")
-def list_referrals(db: Session = Depends(get_db), user: User = Depends(require_roles("medical_officer", "specialist", "navigator"))):
-    rows = db.query(Referral).order_by(Referral.created_at.desc()).all()
+def list_referrals(db: Session = Depends(get_db), user: User = Depends(require_roles("medical_officer", "specialist", "navigator", "super_admin"))):
+    q = db.query(Referral)
+    if user.role == "specialist":
+        q = q.filter(specialist_referral_filter(user))  # only patients the medical officer promoted to this specialist / hospital
     out = []
-    for r in rows:
-        patient = db.get(Patient, r.patient_id)
-        out.append(referral_out(r, patient))
+    for r in q.order_by(Referral.created_at.desc()).all():
+        out.append(referral_out(r, db.get(Patient, r.patient_id), db))
     return out
 
 
 @router.get("/referrals/{referral_id}")
-def get_referral(referral_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("medical_officer", "specialist", "navigator"))):
+def get_referral(referral_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("medical_officer", "specialist", "navigator", "super_admin"))):
     rec = db.get(Referral, referral_id)
-    if not rec:
+    if not rec or not referral_visible(user, rec):
         raise HTTPException(404, "Referral not found")
-    return referral_out(rec, db.get(Patient, rec.patient_id))
+    return referral_out(rec, db.get(Patient, rec.patient_id), db)
 
 
 MEET_RE = re.compile(r"^https://meet\.google\.com/(?:lookup/)?[A-Za-z0-9_-]{3,40}(?:-[A-Za-z0-9_-]{2,40}){0,3}(?:\?[^\s#]*)?$")
@@ -888,6 +1014,29 @@ def fmt_slot(slot: str | None) -> str:
     return f"{dt.strftime('%a, %d %b %Y, %H:%M')} (UTC{off[:3]}:{off[3:]})"
 
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def end_of_slot_day(slot: str | None) -> datetime:
+    """23:59:59 of the day the appointment is scheduled for (UTC slots are read in IST, the service area's time zone)."""
+    dt = parse_slot(slot) or datetime.now(IST)
+    if dt.utcoffset() == timedelta(0):
+        dt = dt.astimezone(IST)
+    return dt.replace(hour=23, minute=59, second=59, microsecond=0)
+
+
+def is_meet_alert(rec: Appointment, title: str) -> bool:
+    """Video-link alerts stay until the scheduled day is over; cancelled / missed / completed notices are plain alerts."""
+    return rec.kind == "video" and not any(w in title.lower() for w in ("cancelled", "completed", "missed"))
+
+
+def officers_for(db: Session, *districts: str | None) -> list[User]:
+    """Active medical officers responsible for the given districts (everyone if none is configured for them)."""
+    want = {d for d in districts if d}
+    rows = db.query(User).filter(User.role == "medical_officer", User.status == "active").all()
+    return [u for u in rows if not u.district or u.district in want] or rows
+
+
 def appointment_parties(db: Session, ref: Referral) -> dict[str, set[str]]:
     """Who should hear about an appointment, grouped by role. Names/clinical details are never sent."""
     parties: dict[str, set[str]] = {"health_worker": set(), "medical_officer": set(), "navigator": set(), "specialist": set()}
@@ -900,16 +1049,20 @@ def appointment_parties(db: Session, ref: Referral) -> dict[str, set[str]]:
         parties["health_worker"].add(patient.created_by)
     if review and review.doctor_id:
         parties["medical_officer"].add(review.doctor_id)
-    for role in ("navigator", "specialist"):
-        for u in db.query(User).filter(User.role == role, User.status == "active").all():
-            parties[role].add(u.id)
+    for u in db.query(User).filter(User.role == "navigator", User.status == "active").all():
+        parties["navigator"].add(u.id)
+    if ref.specialist_id:
+        parties["specialist"].add(ref.specialist_id)
+    elif ref.hospital_id:
+        for u in db.query(User).filter(User.role == "specialist", User.status == "active", User.hospital_id == ref.hospital_id).all():
+            parties["specialist"].add(u.id)
     if not parties["health_worker"] and patient:
         for u in db.query(User).filter(User.role == "health_worker", User.status == "active", User.assigned_facility == patient.facility).all():
             parties["health_worker"].add(u.id)
     return parties
 
 
-def notify_appointment(db: Session, rec: Appointment, actor: User, title: str, body: str, roles: set[str] | None = None, dedupe_minutes: int = 0) -> int:
+def notify_appointment(db: Session, rec: Appointment, actor: User, title: str, body: str, roles: set[str] | None = None, dedupe_minutes: int = 0, extra_ids: set[str] | None = None) -> int:
     ref = db.get(Referral, rec.referral_id)
     if not ref:
         return 0
@@ -917,9 +1070,12 @@ def notify_appointment(db: Session, rec: Appointment, actor: User, title: str, b
     sent = 0
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=dedupe_minutes)
     seen: set[str] = set()
-    for role, ids in appointment_parties(db, ref).items():
-        if roles is not None and role not in roles:
-            continue
+    meet = is_meet_alert(rec, title)
+    expires = end_of_slot_day(rec.slot) if meet else None
+    groups = [ids for role, ids in appointment_parties(db, ref).items() if roles is None or role in roles]
+    if extra_ids:
+        groups.append(extra_ids)
+    for ids in groups:
         for uid_ in ids:
             if uid_ == actor.id or uid_ in seen:
                 continue
@@ -930,7 +1086,7 @@ def notify_appointment(db: Session, rec: Appointment, actor: User, title: str, b
                 .first()
             ):
                 continue
-            notify(db, uid_, title, (body[: 255 - len(tag)] + tag))
+            notify(db, uid_, title, (body[: 255 - len(tag)] + tag), ref=f"appt:{rec.id}", kind="meet" if meet else "info", expires_at=expires)
             sent += 1
     return sent
 
@@ -940,7 +1096,9 @@ def rollback_appointment_notifications(db: Session, appointment_id: str) -> int:
 
     Alerts carry an [appt:<id>] tag, so ending or deleting a call takes them away from every user's list.
     """
-    return db.query(Notification).filter(Notification.body.like(f"%[appt:{appointment_id}]%")).delete(synchronize_session=False)
+    return db.query(Notification).filter(
+        or_(Notification.body.like(f"%[appt:{appointment_id}]%"), Notification.ref.in_([f"appt:{appointment_id}", f"xmandal:{appointment_id}"]))
+    ).delete(synchronize_session=False)
 
 
 def make_call_reminders(db: Session, user: User) -> None:
@@ -958,7 +1116,7 @@ def make_call_reminders(db: Session, user: User) -> None:
         title = "Video consultation starting soon"
         exists = db.query(Notification).filter(Notification.user_id == user.id, Notification.title == title, Notification.body.like(f"%{a.id}%")).first()
         if not exists:
-            notify(db, user.id, title, f"Scheduled for {fmt_slot(a.slot)}. Be ready to join. [appt:{a.id}]")
+            notify(db, user.id, title, f"Scheduled for {fmt_slot(a.slot)}. Be ready to join. [appt:{a.id}]", ref=f"appt:{a.id}", kind="meet", expires_at=end_of_slot_day(a.slot))
             changed = True
     if changed:
         db.commit()
@@ -971,7 +1129,7 @@ def create_appointment(
     user: User = Depends(require_roles("navigator", "specialist", "medical_officer")),
 ):
     ref = db.get(Referral, body.referral_id)
-    if not ref:
+    if not ref or not referral_visible(user, ref):
         raise HTTPException(404, "Referral not found")
     if body.kind not in {"video", "physical"}:
         raise HTTPException(422, "Unknown appointment type")
@@ -988,41 +1146,86 @@ def create_appointment(
         if parse_slot(slot) is None:
             raise HTTPException(422, "Pick a valid date and time")
     meet_url = clean_meet_url(body.meet_url) if body.kind == "video" else None
+
+    # --- hospital + specialist chosen for the patient (patient picks district -> mandal -> hospital -> specialist)
+    patient = db.get(Patient, ref.patient_id)
+    hospital: Hospital | None = None
+    cross, cross_reason = False, None
+    hospital_id = body.hospital_id or ref.hospital_id  # defaults to the hospital the medical officer chose
+    if body.kind == "physical":
+        if not hospital_id:
+            raise HTTPException(422, "Select the hospital the patient chose (district, mandal, then hospital)")
+        hospital = db.get(Hospital, hospital_id)
+        if not hospital or not hospital.available:
+            raise HTTPException(422, "That hospital is not available for booking. Pick another one")
+        if patient and patient.mandal and not (user.role == "specialist" and hospital.id == ref.hospital_id) and (
+            (patient.mandal or "").strip().lower() != hospital.mandal.strip().lower()
+            or (patient.district or hospital.district).strip().lower() != hospital.district.strip().lower()
+        ):
+            cross = True
+            cross_reason = clean(body.cross_reason)
+            if not cross_reason or len(cross_reason) < 5:
+                raise HTTPException(422, "This hospital is outside the patient's mandal. Give the special reason so the medical officer can decide")
+    specialist: User | None = None
+    specialist_id = body.specialist_id or (ref.specialist_id if not body.hospital_id or body.hospital_id == ref.hospital_id else None)
+    if user.role == "specialist" and not specialist_id:
+        specialist_id = user.id
+    if specialist_id:
+        specialist = db.get(User, specialist_id)
+        if not specialist or specialist.role != "specialist" or specialist.status != "active":
+            raise HTTPException(422, "Choose an active specialist")
+        if hospital and specialist.hospital_id != hospital.id:
+            raise HTTPException(422, "That specialist is not registered at the selected hospital")
+    if user.role == "specialist" and not ref.specialist_id:
+        ref.specialist_id = user.id  # accepting a hospital-level referral claims it for this doctor
+    pending = cross and not body.start_now
     rec = Appointment(
         referral_id=ref.id,
         kind=body.kind,
         slot=slot,
-        status=status,
+        status="PENDING_APPROVAL" if pending else status,
         video_provider="google_meet",
         video_url=meet_url,
         video_ref=meet_url.rsplit("/", 1)[-1].split("?")[0] if meet_url else None,
+        hospital_id=hospital.id if hospital else None,
+        specialist_id=specialist.id if specialist else None,
+        booked_by=user.id,
+        cross_mandal=cross,
+        cross_reason=cross_reason[:255] if cross_reason else None,
+        approval_status="PENDING" if pending else "NOT_REQUIRED",
     )
     db.add(rec)
     s = db.query(Screening).join(ClinicalReview, ClinicalReview.screening_id == Screening.id).filter(
         ClinicalReview.id == ref.review_id
     ).first()
-    if s:
+    if s and not pending:
         s.status = "APPOINTED"
     db.flush()
+    clear_notifications(db, f"referral:{ref.id}")  # the "new referral" alerts are answered once an appointment is booked
     label = "Video consultation" if rec.kind == "video" else "Hospital appointment"
-    if body.start_now:
+    where = f" at {hospital.name}, {hospital.mandal}" if hospital else ""
+    who = f" with {specialist.full_name}" if specialist else ""
+    if pending:
+        text = (
+            f"Patient from {patient.mandal}, {patient.district or '—'} wants {hospital.name} ({hospital.mandal}, {hospital.district}) "
+            f"on {fmt_slot(rec.slot)}. Reason: {cross_reason}"
+        )
+        tag = f" [xmandal:{rec.id}]"
+        for officer in officers_for(db, hospital.district, patient.district):
+            if officer.id == user.id:
+                continue  # never ask the person who made the request to approve it
+            notify(db, officer.id, "Cross-mandal appointment request", text[: 255 - len(tag)] + tag, ref=f"xmandal:{rec.id}")
+        audit(db, user.id, "appointment.cross_mandal_request", f"appointment:{rec.id}", json.dumps({"hospital": hospital.id}))
+    elif body.start_now:
         notify_appointment(db, rec, user, "Video consultation is live", "The specialist has started the Google Meet call. Join now with the patient.", roles={"health_worker", "medical_officer", "navigator"})
         audit(db, user.id, "appointment.start_now", f"appointment:{rec.id}")
     else:
         via = " on Google Meet" if rec.kind == "video" else ""
-        notify_appointment(db, rec, user, f"{label} scheduled", f"{label}{via} booked for {fmt_slot(rec.slot)}. No clinical details included.")
+        notify_appointment(db, rec, user, f"{label} scheduled", f"{label}{via}{where}{who} booked for {fmt_slot(rec.slot)}. No clinical details included.")
         audit(db, user.id, "appointment.create", f"appointment:{rec.id}")
     db.commit()
     db.refresh(rec)
-    return {
-        "id": rec.id,
-        "referral_id": rec.referral_id,
-        "kind": rec.kind,
-        "slot": rec.slot,
-        "status": rec.status,
-        "video_ref": rec.video_ref,
-        "has_meet_link": bool(rec.video_url),
-    }
+    return appointment_out(rec, db)
 
 
 @router.patch("/appointments/{appointment_id}")
@@ -1035,13 +1238,25 @@ def patch_appointment(
     rec = db.get(Appointment, appointment_id)
     if not rec:
         raise HTTPException(404, "Appointment not found")
+    if user.role == "specialist":
+        _ref = db.get(Referral, rec.referral_id)
+        if rec.specialist_id != user.id and not (_ref and referral_visible(user, _ref)):
+            raise HTTPException(403, "This appointment belongs to another specialist")
     allowed = {"REQUESTED", "CONFIRMED", "COMPLETED", "MISSED", "CANCELLED", "RESCHEDULED"}
     if body.status not in allowed:
         raise HTTPException(400, "Invalid appointment status")
+    if rec.approval_status == "PENDING" and body.status != "CANCELLED":
+        raise HTTPException(409, "This cross-mandal request is waiting for the medical officer's decision. You can only withdraw it")
+    if rec.approval_status == "PENDING":  # withdrawn before the officer answered
+        rec.approval_status = "WITHDRAWN"
+        rec.approval_note = "Withdrawn by the person who booked it"
     rec.status = body.status
     rec.attendance_outcome = body.attendance_outcome
     if body.slot:
         rec.slot = body.slot
+        # video-link alerts now expire after the NEW scheduled day
+        db.query(Notification).filter(Notification.ref == f"appt:{rec.id}", Notification.kind == "meet").update({"expires_at": end_of_slot_day(rec.slot)}, synchronize_session=False)
+    clear_notifications(db, f"appt:{rec.id}")  # an action was taken: earlier plain alerts about it are superseded (video links stay)
     if body.meet_url and rec.kind == "video":
         rec.video_url = clean_meet_url(body.meet_url)
         rec.video_provider = "google_meet"
@@ -1114,8 +1329,50 @@ def delete_appointment(
     return {"deleted": True, "id": appointment_id, "alerts_removed": removed}
 
 
-def appointment_out(a: Appointment) -> dict:
+def navigation_details(db: Session, ref: Referral | None, appt: Appointment | None = None) -> dict:
+    """Everything a navigator needs to guide the patient: patient contact + the specialist and hospital they will meet."""
+    patient = db.get(Patient, ref.patient_id) if ref else None
+    hid = (appt.hospital_id if appt and appt.hospital_id else None) or (ref.hospital_id if ref else None)
+    sid = (appt.specialist_id if appt and appt.specialist_id else None) or (ref.specialist_id if ref else None)
+    h = db.get(Hospital, hid) if hid else None
+    sp = db.get(User, sid) if sid else None
     return {
+        "patient_name": patient.full_name if patient else None,
+        "patient_age": patient.age if patient else None,
+        "patient_sex": patient.sex if patient else None,
+        "patient_phone": patient.phone if patient else None,
+        "patient_address": ", ".join(x for x in [patient.address, patient.village, patient.mandal, patient.district] if x) if patient else None,
+        "patient_village": patient.village if patient else None,
+        "nav_specialist_name": sp.full_name if sp else None,
+        "nav_specialist_phone": sp.phone if sp else None,
+        "nav_specialist_specialty": sp.specialty if sp else (ref.specialty if ref else None),
+        "nav_hospital_name": h.name if h else (ref.facility if ref else None),
+        "nav_hospital_address": h.address if h else None,
+        "nav_hospital_phone": h.contact_phone if h else None,
+        "nav_hospital_place": f"{h.mandal}, {h.district}" if h else None,
+    }
+
+
+def appointment_out(a: Appointment, db: Session | None = None, detail: bool = False) -> dict:
+    hospital = db.get(Hospital, a.hospital_id) if db and a.hospital_id else None
+    specialist = db.get(User, a.specialist_id) if db and a.specialist_id else None
+    extra: dict = {}
+    if detail and db:  # navigators / specialists also get who the patient is and who they will meet
+        extra = navigation_details(db, db.get(Referral, a.referral_id), a)
+    return {
+        **extra,
+        "hospital_id": a.hospital_id,
+        "hospital_name": hospital.name if hospital else None,
+        "hospital_mandal": hospital.mandal if hospital else None,
+        "hospital_district": hospital.district if hospital else None,
+        "hospital_address": hospital.address if hospital else None,
+        "hospital_phone": hospital.contact_phone if hospital else None,
+        "specialist_id": a.specialist_id,
+        "specialist_name": specialist.full_name if specialist else None,
+        "cross_mandal": bool(a.cross_mandal),
+        "cross_reason": a.cross_reason,
+        "approval_status": a.approval_status or "NOT_REQUIRED",
+        "approval_note": a.approval_note,
         "id": a.id,
         "referral_id": a.referral_id,
         "kind": a.kind,
@@ -1128,21 +1385,28 @@ def appointment_out(a: Appointment) -> dict:
 
 
 @router.get("/appointments")
-def list_appointments(db: Session = Depends(get_db), user: User = Depends(require_roles("navigator", "specialist", "medical_officer", "health_worker"))):
+def list_appointments(db: Session = Depends(get_db), user: User = Depends(require_roles("navigator", "specialist", "medical_officer", "health_worker", "super_admin"))):
     rows = db.query(Appointment).order_by(Appointment.created_at.desc()).all()
-    return [appointment_out(a) for a in rows]
+    if user.role == "specialist":
+        mine = {r.id for r in db.query(Referral).filter(specialist_referral_filter(user)).all()}
+        rows = [a for a in rows if a.referral_id in mine or a.specialist_id == user.id]
+    return [appointment_out(a, db, detail=user.role in {"navigator", "specialist"}) for a in rows]
 
 
 @router.get("/appointments/{appointment_id}")
 def get_appointment(
     appointment_id: str,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("navigator", "specialist", "medical_officer", "health_worker")),
+    user: User = Depends(require_roles("navigator", "specialist", "medical_officer", "health_worker", "super_admin")),
 ):
     rec = db.get(Appointment, appointment_id)
     if not rec:
         raise HTTPException(404, "Appointment not found")
-    return appointment_out(rec)
+    if user.role == "specialist":
+        ref = db.get(Referral, rec.referral_id)
+        if rec.specialist_id != user.id and not (ref and referral_visible(user, ref)):
+            raise HTTPException(404, "Appointment not found")
+    return appointment_out(rec, db, detail=user.role in {"navigator", "specialist"})
 
 
 @router.get("/appointments/{appointment_id}/video")
@@ -1180,7 +1444,7 @@ def create_investigation(
     user: User = Depends(require_roles("specialist", "medical_officer")),
 ):
     ref = db.get(Referral, body.referral_id)
-    if not ref:
+    if not ref or not referral_visible(user, ref):
         raise HTTPException(404, "Referral not found")
     rec = Investigation(referral_id=ref.id, kind=body.kind, state="ADVISED")
     db.add(rec)
@@ -1200,6 +1464,10 @@ def patch_investigation(
     rec = db.get(Investigation, investigation_id)
     if not rec:
         raise HTTPException(404, "Investigation not found")
+    if user.role == "specialist":
+        _ref = db.get(Referral, rec.referral_id)
+        if not (_ref and referral_visible(user, _ref)):
+            raise HTTPException(403, "This case belongs to another specialist")
     allowed = {
         "ADVISED",
         "SCHEDULED",
@@ -1241,23 +1509,31 @@ def list_investigations(db: Session = Depends(get_db), user: User = Depends(curr
     if user.role == "admin":
         raise HTTPException(403, "Administrators receive aggregate data only")
     rows = db.query(Investigation).order_by(Investigation.created_at.desc()).all()
+    if user.role == "specialist":
+        mine = {r.id for r in db.query(Referral).filter(specialist_referral_filter(user)).all()}
+        rows = [i for i in rows if i.referral_id in mine]
     return [{"id": i.id, "referral_id": i.referral_id, "kind": i.kind, "state": i.state, "report_note": i.report_note, "clinician_result": i.clinician_result} for i in rows]
 
 
 @router.get("/navigation")
-def list_nav(db: Session = Depends(get_db), user: User = Depends(require_roles("navigator", "medical_officer"))):
+def list_nav(db: Session = Depends(get_db), user: User = Depends(require_roles("navigator", "medical_officer", "super_admin"))):
     rows = db.query(NavigationTask).order_by(NavigationTask.created_at.desc()).all()
     out = []
     for t in rows:
         ref = db.get(Referral, t.referral_id)
         patient = db.get(Patient, ref.patient_id) if ref else None
+        appt = db.query(Appointment).filter(Appointment.referral_id == t.referral_id, Appointment.status != "CANCELLED").order_by(Appointment.created_at.desc()).first()
         out.append(
             {
+                **navigation_details(db, ref, appt),
                 "id": t.id,
                 "referral_id": t.referral_id,
-                "patient_name": patient.full_name if patient else None,
                 "village": patient.village if patient else None,
                 "facility": ref.facility if ref else None,
+                "priority": ref.priority if ref else None,
+                "appointment_slot": appt.slot if appt else None,
+                "appointment_status": appt.status if appt else None,
+                "appointment_kind": appt.kind if appt else None,
                 "status": t.status,
                 "due": t.due,
                 "contact_log": t.contact_log,
@@ -1320,45 +1596,71 @@ def timeline(patient_id: str, db: Session = Depends(get_db), user: User = Depend
 
 
 @router.get("/dashboard/summary")
-def dashboard(db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "medical_officer"))):
-    def count(model, **kw):
-        q = db.query(model)
-        for k, v in kw.items():
-            q = q.filter(getattr(model, k) == v)
-        return q.count()
-
+def dashboard(
+    district: str | None = None,
+    mandal: str | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*ADMIN_ROLES, "medical_officer")),
+):
+    """Programme indicators. District admins / super admins may narrow them to one district and/or mandal."""
+    S = GeoScope(db, district, mandal) if user.role in ADMIN_ROLES else GeoScope(db)
     payload = {
-        "screenings": count(Screening),
-        "reviews": count(ClinicalReview),
-        "referrals": count(Referral),
-        "appointments_completed": db.query(Appointment).filter(Appointment.status == "COMPLETED").count(),
-        "appointments_overdue": db.query(Appointment).filter(Appointment.status.in_(["MISSED", "REQUESTED"])).count(),
-        "investigations_pending": db.query(Investigation).filter(Investigation.state != "CLINICIAN_REVIEWED").count(),
-        "investigations_done": db.query(Investigation).filter(Investigation.state == "CLINICIAN_REVIEWED").count(),
-        "navigation_open": db.query(NavigationTask).filter(NavigationTask.status.in_(["OPEN", "OVERDUE"])).count(),
-        "ai_suspicious_demo": db.query(AiAnalysis).filter(AiAnalysis.research_label == "suspicious_example").count(),
+        "screenings": S.q(Screening).count(),
+        "reviews": S.q(ClinicalReview).count(),
+        "referrals": S.q(Referral).count(),
+        "appointments_completed": S.q(Appointment).filter(Appointment.status == "COMPLETED").count(),
+        "appointments_overdue": S.q(Appointment).filter(Appointment.status.in_(["MISSED", "REQUESTED"])).count(),
+        "investigations_pending": S.q(Investigation).filter(Investigation.state != "CLINICIAN_REVIEWED").count(),
+        "investigations_done": S.q(Investigation).filter(Investigation.state == "CLINICIAN_REVIEWED").count(),
+        "navigation_open": S.q(NavigationTask).filter(NavigationTask.status.in_(["OPEN", "OVERDUE"])).count(),
+        "ai_suspicious_demo": S.q(AiAnalysis).filter(AiAnalysis.research_label == "suspicious_example").count(),
+        "scope": {"district": S.district, "mandal": S.mandal, "level": S.level},
         "note": "Aggregated synthetic programme indicators only. Admin accounts cannot open identifiable records.",
     }
-    audit(db, user.id, "dashboard.view", "dashboard:summary")
+    audit(db, user.id, "dashboard.view", "dashboard:summary", json.dumps(payload["scope"]))
     db.commit()
     return payload
 
 
-def _group_count(db: Session, col) -> dict:
-    from sqlalchemy import func
-    return {(k or "unknown"): n for k, n in db.query(col, func.count()).group_by(col).all()}
+def _group_count(S: GeoScope, model, col) -> dict:
+    return {(k or "unknown"): n for k, n in S.q(model, col, func.count()).group_by(col).all()}
+
+
+def _area_rows(S: GeoScope, col) -> list[dict]:
+    """Patients / screenings / referrals grouped by a patient location column (district or mandal)."""
+    areas: dict[str, dict] = {}
+    pmap: dict[str, str] = {}
+    for pid, key in S.q(Patient, Patient.id, col).all():
+        name = (key or "").strip() or "Unspecified"
+        pmap[pid] = name
+        areas.setdefault(name, {"area": name, "patients": 0, "screenings": 0, "referrals": 0})["patients"] += 1
+    for (pid,) in S.q(Screening, Screening.patient_id).all():
+        a = areas.get(pmap.get(pid, ""))
+        if a:
+            a["screenings"] += 1
+    for (pid,) in S.q(Referral, Referral.patient_id).all():
+        a = areas.get(pmap.get(pid, ""))
+        if a:
+            a["referrals"] += 1
+    return sorted(areas.values(), key=lambda a: (-a["patients"], a["area"]))
 
 
 @router.get("/admin/monitoring")
-def admin_monitoring(db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
-    """Aggregated district monitoring. No identifiable patient data is returned."""
+def admin_monitoring(
+    district: str | None = None,
+    mandal: str | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*ADMIN_ROLES)),
+):
+    """Aggregated monitoring for the whole programme, one district, or one mandal. No identifiable patient data."""
+    S = GeoScope(db, district, mandal)
     now = datetime.now(timezone.utc)
-    n_patients = db.query(Patient).count()
-    n_screen = db.query(Screening).count()
-    n_review = db.query(ClinicalReview).count()
-    n_ref = db.query(Referral).count()
-    n_appt_done = db.query(Appointment).filter(Appointment.status == "COMPLETED").count()
-    n_inv_done = db.query(Investigation).filter(Investigation.state == "CLINICIAN_REVIEWED").count()
+    n_patients = S.q(Patient).count()
+    n_screen = S.q(Screening).count()
+    n_review = S.q(ClinicalReview).count()
+    n_ref = S.q(Referral).count()
+    n_appt_done = S.q(Appointment).filter(Appointment.status == "COMPLETED").count()
+    n_inv_done = S.q(Investigation).filter(Investigation.state == "CLINICIAN_REVIEWED").count()
 
     funnel = [
         {"stage": "Patients registered", "value": n_patients},
@@ -1369,20 +1671,20 @@ def admin_monitoring(db: Session = Depends(get_db), user: User = Depends(require
         {"stage": "Investigations reviewed", "value": n_inv_done},
     ]
 
-    pending_reviews = db.query(Screening).filter(Screening.status.in_(["SUBMITTED", "AWAITING_REVIEW", "PENDING_REVIEW"])).count()
+    pending_reviews = S.q(Screening).filter(Screening.status.in_(["SUBMITTED", "AWAITING_REVIEW", "PENDING_REVIEW"])).count()
     alerts = [
         {"label": "Screenings awaiting review", "value": pending_reviews, "kind": "warn"},
-        {"label": "Urgent referrals open", "value": db.query(Referral).filter(Referral.priority == "urgent", Referral.status != "CLOSED").count(), "kind": "bad"},
-        {"label": "Missed appointments", "value": db.query(Appointment).filter(Appointment.status == "MISSED").count(), "kind": "bad"},
-        {"label": "Appointments awaiting confirmation", "value": db.query(Appointment).filter(Appointment.status == "REQUESTED").count(), "kind": "warn"},
-        {"label": "Investigations pending", "value": db.query(Investigation).filter(Investigation.state != "CLINICIAN_REVIEWED").count(), "kind": "warn"},
-        {"label": "Navigation tasks open/overdue", "value": db.query(NavigationTask).filter(NavigationTask.status.in_(["OPEN", "OVERDUE"])).count(), "kind": "warn"},
+        {"label": "Urgent referrals open", "value": S.q(Referral).filter(Referral.priority == "urgent", Referral.status != "CLOSED").count(), "kind": "bad"},
+        {"label": "Missed appointments", "value": S.q(Appointment).filter(Appointment.status == "MISSED").count(), "kind": "bad"},
+        {"label": "Appointments awaiting confirmation", "value": S.q(Appointment).filter(Appointment.status == "REQUESTED").count(), "kind": "warn"},
+        {"label": "Investigations pending", "value": S.q(Investigation).filter(Investigation.state != "CLINICIAN_REVIEWED").count(), "kind": "warn"},
+        {"label": "Navigation tasks open/overdue", "value": S.q(NavigationTask).filter(NavigationTask.status.in_(["OPEN", "OVERDUE"])).count(), "kind": "warn"},
     ]
 
     # 14-day screening trend
     start = (now - timedelta(days=13)).replace(hour=0, minute=0, second=0, microsecond=0)
     per_day: dict[str, int] = {}
-    for (created,) in db.query(Screening.created_at).filter(Screening.created_at >= start).all():
+    for (created,) in S.q(Screening, Screening.created_at).filter(Screening.created_at >= start).all():
         if created is None:
             continue
         key = created.date().isoformat()
@@ -1392,53 +1694,47 @@ def admin_monitoring(db: Session = Depends(get_db), user: User = Depends(require
         d = (start + timedelta(days=i)).date().isoformat()
         trend.append({"date": d, "count": per_day.get(d, 0)})
 
-    from sqlalchemy import func
-    active_roles = {
-        r: n for r, n in
-        db.query(User.role, func.count()).filter(User.status == "active", User.role != "admin").group_by(User.role).all()
-    }
-    staff = {"by_role": active_roles, "pending": db.query(User).filter(User.status == "pending").count()}
+    # Staff, narrowed by the district / mandal they registered under
+    def staff_q(*cols):
+        q = db.query(*cols).filter(User.role.notin_(ADMIN_ROLES))
+        if S.district:
+            q = q.filter(User.district == S.district)
+        if S.mandal:
+            q = q.filter(User.mandal == S.mandal)
+        return q
 
-    # Area-wise (mandal) activity
-    areas: dict[str, dict] = {}
-    pmap = {}
-    for pid, mandal in db.query(Patient.id, Patient.mandal).all():
-        name = (mandal or "").strip() or "Unspecified"
-        pmap[pid] = name
-        areas.setdefault(name, {"area": name, "patients": 0, "screenings": 0, "referrals": 0})["patients"] += 1
-    for (pid,) in db.query(Screening.patient_id).all():
-        a = areas.get(pmap.get(pid, "Unspecified"))
-        if a:
-            a["screenings"] += 1
-    for (pid,) in db.query(Referral.patient_id).all():
-        a = areas.get(pmap.get(pid, "Unspecified"))
-        if a:
-            a["referrals"] += 1
-    by_area = sorted(areas.values(), key=lambda a: (-a["patients"], a["area"]))
+    active_roles = {r: n for r, n in staff_q(User.role, func.count()).filter(User.status == "active").group_by(User.role).all()}
+    staff = {
+        "by_role": active_roles,
+        "pending": staff_q(User.id).filter(User.status == "pending").count(),
+        "suspended": staff_q(User.id).filter(User.status == "suspended").count(),
+    }
 
     payload = {
+        "scope": {"district": S.district, "mandal": S.mandal, "level": S.level},
         "funnel": funnel,
         "alerts": alerts,
         "trend": trend,
         "staff": staff,
-        "by_area": by_area,
-        "screening_status": _group_count(db, Screening.status),
-        "referral_status": _group_count(db, Referral.status),
-        "referral_priority": _group_count(db, Referral.priority),
-        "appointment_status": _group_count(db, Appointment.status),
-        "investigation_state": _group_count(db, Investigation.state),
-        "navigation_status": _group_count(db, NavigationTask.status),
-        "ai_labels": _group_count(db, AiAnalysis.research_label),
+        "by_district": _area_rows(S, Patient.district),
+        "by_area": _area_rows(S, Patient.mandal),
+        "screening_status": _group_count(S, Screening, Screening.status),
+        "referral_status": _group_count(S, Referral, Referral.status),
+        "referral_priority": _group_count(S, Referral, Referral.priority),
+        "appointment_status": _group_count(S, Appointment, Appointment.status),
+        "investigation_state": _group_count(S, Investigation, Investigation.state),
+        "navigation_status": _group_count(S, NavigationTask, NavigationTask.status),
+        "ai_labels": _group_count(S, AiAnalysis, AiAnalysis.research_label),
         "generated_at": now.isoformat(),
         "note": "Aggregated programme indicators only. Admin accounts cannot open identifiable records.",
     }
-    audit(db, user.id, "admin.monitoring.view", "admin:monitoring")
+    audit(db, user.id, "admin.monitoring.view", "admin:monitoring", json.dumps(payload["scope"]))
     db.commit()
     return payload
 
 
 @router.get("/audit")
-def list_audit(db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "medical_officer"))):
+def list_audit(db: Session = Depends(get_db), user: User = Depends(require_roles(*ADMIN_ROLES, "medical_officer"))):
     rows = db.query(AuditEvent).order_by(AuditEvent.created_at.desc()).limit(500).all()
     actors = {u.id: u for u in db.query(User).all()}
     return [
@@ -1457,9 +1753,32 @@ def list_audit(db: Session = Depends(get_db), user: User = Depends(require_roles
 
 @router.get("/notifications")
 def list_notes(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    # video-link alerts vanish once their scheduled day is over
+    db.query(Notification).filter(Notification.expires_at.isnot(None), Notification.expires_at < datetime.now(timezone.utc)).delete(synchronize_session=False)
+    db.commit()
     make_call_reminders(db, user)
     rows = db.query(Notification).filter(Notification.user_id == user.id).order_by(Notification.created_at.desc()).all()
-    return [{"id": n.id, "title": n.title, "body": n.body, "read": n.read, "created_at": n.created_at.isoformat()} for n in rows]
+    return [
+        {
+            "id": n.id, "title": n.title, "body": n.body, "read": n.read, "created_at": n.created_at.isoformat(),
+            "kind": "meet" if _is_meet_note(n) else "info",
+            "action_pending": _awaits_action(n),
+            "expires_at": n.expires_at.isoformat() if n.expires_at else None,
+        }
+        for n in rows
+    ]
+
+
+def _awaits_action(n: Notification) -> bool:
+    """Requests that stay until someone answers them: cross-mandal requests, registrations, new referrals."""
+    return bool(n.ref) and n.ref.split(":", 1)[0] in {"xmandal", "user", "referral"}
+
+
+def _is_meet_note(n: Notification) -> bool:
+    """Alerts made before the kind column existed are recognised by their video title and appointment tag."""
+    if n.kind == "meet":
+        return True
+    return n.ref is None and "video" in (n.title or "").lower() and "[appt:" in (n.body or "")
 
 
 @router.patch("/notifications/{note_id}")
@@ -1467,9 +1786,13 @@ def read_note(note_id: str, db: Session = Depends(get_db), user: User = Depends(
     rec = db.get(Notification, note_id)
     if not rec or rec.user_id != user.id:
         raise HTTPException(404, "Notification not found")
-    rec.read = True
+    if _is_meet_note(rec) or _awaits_action(rec):  # video links wait for their day to end; requests wait for the decision
+        rec.read = True
+        db.commit()
+        return {"id": rec.id, "read": True, "cleared": False}
+    db.delete(rec)  # plain alerts are cleared as soon as the person acts on / opens them
     db.commit()
-    return {"id": rec.id, "read": True}
+    return {"id": note_id, "read": True, "cleared": True}
 
 
 def _work_status(db: Session, u: User) -> dict:
@@ -1518,21 +1841,39 @@ def _work_status(db: Session, u: User) -> dict:
     }
 
 
+def _manageable(actor: User, target: User) -> bool:
+    """District admins manage staff only; super admins can manage every account (including admins)."""
+    return actor.role == "super_admin" or target.role not in ADMIN_ROLES
+
+
 @router.get("/admin/users")
-def admin_list_users(status: str | None = None, role: str | None = None, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
-    q = db.query(User).filter(User.role != "admin")
+def admin_list_users(
+    status: str | None = None,
+    role: str | None = None,
+    district: str | None = None,
+    mandal: str | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(*ADMIN_ROLES)),
+):
+    q = db.query(User)
+    if user.role != "super_admin":
+        q = q.filter(User.role.notin_(ADMIN_ROLES))
     if status:
         q = q.filter(User.status == status)
     if role:
         q = q.filter(User.role == role)
+    if clean(district):
+        q = q.filter(User.district == clean(district))
+    if clean(mandal):
+        q = q.filter(User.mandal == clean(mandal))
     rows = q.order_by(User.created_at.desc()).all()
     return [user_out(u) for u in rows]
 
 
 @router.get("/admin/users/{user_id}")
-def admin_get_user(user_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
+def admin_get_user(user_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles(*ADMIN_ROLES))):
     u = db.get(User, user_id)
-    if not u or u.role == "admin":
+    if not u or not _manageable(user, u):
         raise HTTPException(404, "User not found")
     audit(db, user.id, "admin.user.view", f"user:{u.id}")
     db.commit()
@@ -1541,11 +1882,12 @@ def admin_get_user(user_id: str, db: Session = Depends(get_db), user: User = Dep
 
 def _decide_user(user_id: str, decision: str, db: Session, admin: User) -> dict:
     u = db.get(User, user_id)
-    if not u or u.role == "admin":
+    if not u or not _manageable(admin, u):
         raise HTTPException(404, "User not found")
     if u.status != "pending":
         raise HTTPException(409, f"Registration already {u.status}")
     u.status = "active" if decision == "approve" else "rejected"
+    clear_notifications(db, f"user:{u.id}")  # the approval request is answered: remove it from every admin's list
     notify(db, u.id, "Registration " + ("approved" if decision == "approve" else "declined"), "Your account was reviewed by the district admin.")
     audit(db, admin.id, f"admin.user.{decision}", f"user:{u.id}", json.dumps({"role": u.role}))
     db.commit()
@@ -1553,17 +1895,54 @@ def _decide_user(user_id: str, decision: str, db: Session, admin: User) -> dict:
 
 
 @router.post("/admin/users/{user_id}/approve")
-def approve_user(user_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
+def approve_user(user_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles(*ADMIN_ROLES))):
     return _decide_user(user_id, "approve", db, user)
 
 
 @router.post("/admin/users/{user_id}/reject")
-def reject_user(user_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
+def reject_user(user_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles(*ADMIN_ROLES))):
     return _decide_user(user_id, "reject", db, user)
 
 
+@router.post("/admin/users/{user_id}/suspend")
+def suspend_user(user_id: str, body: SuspendIn | None = None, db: Session = Depends(get_db), user: User = Depends(require_roles(*ADMIN_ROLES))):
+    """Soft-delete: the person can no longer sign in, but the account and every record linked to it stay in the database."""
+    u = db.get(User, user_id)
+    if not u or not _manageable(user, u):
+        raise HTTPException(404, "User not found")
+    if u.id == user.id:
+        raise HTTPException(400, "You cannot suspend your own account")
+    if u.status != "active":
+        raise HTTPException(409, f"Only active accounts can be suspended (this one is {u.status})")
+    if u.role == "super_admin" and db.query(User).filter(User.role == "super_admin", User.status == "active", User.id != u.id).count() == 0:
+        raise HTTPException(409, "At least one active super admin must remain")
+    reason = clean(body.reason if body else None)
+    u.status = "suspended"
+    u.suspended_at = datetime.now(timezone.utc)
+    u.suspension_reason = reason[:255] if reason else None
+    audit(db, user.id, "admin.user.suspend", f"user:{u.id}", json.dumps({"role": u.role, "reason": u.suspension_reason}))
+    db.commit()
+    return user_out(u)
+
+
+@router.post("/admin/users/{user_id}/reactivate")
+def reactivate_user(user_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles(*ADMIN_ROLES))):
+    u = db.get(User, user_id)
+    if not u or not _manageable(user, u):
+        raise HTTPException(404, "User not found")
+    if u.status != "suspended":
+        raise HTTPException(409, f"Only suspended accounts can be reactivated (this one is {u.status})")
+    u.status = "active"
+    u.suspended_at = None
+    u.suspension_reason = None
+    notify(db, u.id, "Account restored", "Your account was reactivated by the district admin.")
+    audit(db, user.id, "admin.user.reactivate", f"user:{u.id}", json.dumps({"role": u.role}))
+    db.commit()
+    return user_out(u)
+
+
 @router.post("/admin/reset-demo")
-def reset_demo(db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
+def reset_demo(db: Session = Depends(get_db), user: User = Depends(require_roles(*ADMIN_ROLES))):
     for model in (
         Notification,
         AuditEvent,

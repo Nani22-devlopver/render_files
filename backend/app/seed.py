@@ -12,8 +12,11 @@ from .models import (
     Appointment,
     ClinicalReview,
     Consent,
+    District,
+    Hospital,
     ImageRecord,
     Investigation,
+    Mandal,
     NavigationTask,
     Patient,
     Referral,
@@ -25,6 +28,8 @@ from .security import hash_password
 
 DEMO_PASSWORD = "Demo@123"
 FACILITY = "PHC G. Madugula"
+DEFAULT_DISTRICT = "Alluri Sitharama Raju"  # starter entry so the demo works; admins add the rest in the app
+DEFAULT_MANDAL = "G. Madugula"
 PIPELINE_MARK = "[demo-pipeline]"  # stored in Patient.medical_history so the seed runs only once per database
 
 USERS = [
@@ -36,7 +41,96 @@ USERS = [
 ]
 
 
+def seed_geography(db: Session) -> None:
+    """Starter district/mandal so registration forms are usable on a fresh database."""
+    if db.query(District).first():
+        return
+    d = District(name=DEFAULT_DISTRICT)
+    db.add(d)
+    db.flush()
+    db.add(Mandal(district_id=d.id, name=DEFAULT_MANDAL))
+    db.flush()
+
+
+DEMO_HOSPITALS = [
+    # (name, mandal, address, phone)
+    ("CHC G. Madugula", "G. Madugula", "Main road, G. Madugula", "08935-250001"),
+    ("PHC G. Madugula", "G. Madugula", "PHC campus, G. Madugula", "08935-250002"),
+    ("Area Hospital Paderu", "Paderu", "Hospital road, Paderu", "08935-250003"),
+]
+
+
+def seed_demo_hospitals(db: Session) -> None:
+    """Starter hospitals (two in G. Madugula, one in Paderu) so booking and cross-mandal requests can be tried out."""
+    if db.query(Hospital).first():
+        return
+    d = db.query(District).filter(District.name == DEFAULT_DISTRICT).first()
+    if not d:
+        return
+    officer = db.query(User).filter(User.role == "medical_officer").first()
+    for name, mandal, address, phone in DEMO_HOSPITALS:
+        if not db.query(Mandal).filter(Mandal.district_id == d.id, Mandal.name == mandal).first():
+            db.add(Mandal(district_id=d.id, name=mandal))
+            db.flush()
+        db.add(Hospital(name=name, district=DEFAULT_DISTRICT, mandal=mandal, address=address, contact_phone=phone, created_by=officer.id if officer else None))
+    db.flush()
+
+
+def seed_demo_specialists(db: Session) -> None:
+    """Demo specialists are registered in a hospital (normally done by the district admin) and old referrals get their hospital."""
+    by_name = {h.name.lower(): h for h in db.query(Hospital).all()}
+    paderu, chc = by_name.get("area hospital paderu"), by_name.get("chc g. madugula")
+    spec = db.query(User).filter(User.email == "spec@demo.local").first()
+    if spec and not spec.hospital_id and paderu:
+        spec.hospital_id, spec.assigned_facility, spec.specialty, spec.phone = paderu.id, paderu.name, "Oral surgery / ENT", "9000000001"
+        spec.district, spec.mandal = paderu.district, paderu.mandal
+    if chc and not db.query(User).filter(User.email == "spec2@demo.local").first():
+        db.add(User(email="spec2@demo.local", full_name="Dr. Suresh Specialist", password_hash=hash_password(DEMO_PASSWORD), role="specialist",
+                    assigned_facility=chc.name, district=chc.district, mandal=chc.mandal, hospital_id=chc.id, specialty="Oral medicine", phone="9000000002"))
+    for r in db.query(Referral).filter(Referral.hospital_id.is_(None)).all():  # referrals made before hospitals were linked
+        h = by_name.get((r.facility or "").lower())
+        if h:
+            r.hospital_id = h.id
+    db.flush()
+
+
+def ensure_super_admin(db: Session) -> None:
+    """Make sure a super admin exists (also on databases created before this role was added)."""
+    if db.query(User).filter(User.role == "super_admin").first():
+        return
+    email = settings.SUPER_ADMIN_EMAIL.strip().lower()
+    if db.query(User).filter(User.email == email).first():
+        return
+    db.add(
+        User(
+            email=email,
+            full_name=settings.SUPER_ADMIN_NAME,
+            password_hash=hash_password(settings.SUPER_ADMIN_PASSWORD),
+            role="super_admin",
+            assigned_facility=FACILITY,
+        )
+    )
+    db.flush()
+
+
+def backfill_geography(db: Session) -> None:
+    """Give records created before districts existed a district, using their mandal name when it is unambiguous."""
+    by_mandal: dict[str, set[str]] = {}
+    for dname, mname in db.query(District.name, Mandal.name).join(Mandal, Mandal.district_id == District.id).all():
+        by_mandal.setdefault(mname.lower(), set()).add(dname)
+    for p in db.query(Patient).filter(Patient.district.is_(None)).all():
+        match = by_mandal.get((p.mandal or "").strip().lower())
+        if match and len(match) == 1:
+            p.district = next(iter(match))
+    if DEFAULT_MANDAL.lower() in by_mandal and len(by_mandal[DEFAULT_MANDAL.lower()]) == 1:
+        d = next(iter(by_mandal[DEFAULT_MANDAL.lower()]))
+        for u in db.query(User).filter(User.district.is_(None), User.assigned_facility == FACILITY, User.role != "super_admin").all():
+            u.district, u.mandal = d, DEFAULT_MANDAL
+    db.commit()
+
+
 def seed_if_empty(db: Session) -> None:
+    seed_geography(db)
     if not db.query(User).first():
         for email, name, role in USERS:
             db.add(
@@ -46,9 +140,14 @@ def seed_if_empty(db: Session) -> None:
                     password_hash=hash_password(DEMO_PASSWORD),
                     role=role,
                     assigned_facility=FACILITY,
+                    district=None if role == "admin" else DEFAULT_DISTRICT,
+                    mandal=None if role == "admin" else DEFAULT_MANDAL,
                 )
             )
         db.flush()
+    ensure_super_admin(db)
+    seed_demo_hospitals(db)
+    seed_demo_specialists(db)
     if not db.query(Patient).first():
         hw = db.query(User).filter(User.email == "hw@demo.local").first()
         db.add(
@@ -60,6 +159,7 @@ def seed_if_empty(db: Session) -> None:
                 village="G. Madugula",
                 habitation="Demo habitation",
                 gram_panchayat="G. Madugula",
+                district=DEFAULT_DISTRICT,
                 mandal="G. Madugula",
                 phc=FACILITY,
                 tobacco_use="gutkha daily",
@@ -73,6 +173,7 @@ def seed_if_empty(db: Session) -> None:
     db.commit()
     if settings.SEED_DEMO_DATA:
         seed_demo_pipeline(db)
+    backfill_geography(db)
 
 
 def _synthetic_photo() -> bytes:
@@ -127,7 +228,7 @@ def seed_demo_pipeline(db: Session) -> None:
     def patient(name, age, sex, phone, village, symptoms, tobacco, days_ago):
         p = Patient(
             full_name=name, age=age, sex=sex, phone=phone, village=village, habitation="Demo habitation",
-            gram_panchayat=village, mandal="G. Madugula", phc=FACILITY, tobacco_use=tobacco, symptoms=symptoms,
+            gram_panchayat=village, district=DEFAULT_DISTRICT, mandal="G. Madugula", phc=FACILITY, tobacco_use=tobacco, symptoms=symptoms,
             medical_history=f"Synthetic record {PIPELINE_MARK}", facility=FACILITY, created_by=hw.id,
             created_at=now - timedelta(days=days_ago),
         )
@@ -179,7 +280,8 @@ def seed_demo_pipeline(db: Session) -> None:
                             outcome="refer", ai_agreement="agree", signed_at=now - timedelta(days=8))
     db.add(review)
     db.flush()
-    ref = Referral(review_id=review.id, patient_id=p3.id, facility="Area Hospital Paderu", specialty="Oral surgery / ENT",
+    _ph = db.query(Hospital).filter(Hospital.name == "Area Hospital Paderu").first()
+    ref = Referral(review_id=review.id, patient_id=p3.id, facility="Area Hospital Paderu", hospital_id=(_ph.id if _ph else None), specialty="Oral surgery / ENT",
                    priority="soon", reason=review.finding, status="OPEN", created_by=mo.id, created_at=now - timedelta(days=8))
     db.add(ref)
     db.flush()
@@ -195,7 +297,7 @@ def seed_demo_pipeline(db: Session) -> None:
                              outcome="refer", ai_agreement="agree", signed_at=now - timedelta(days=19))
     db.add(review4)
     db.flush()
-    ref4 = Referral(review_id=review4.id, patient_id=p4.id, facility="Area Hospital Paderu", specialty="Oral surgery / ENT",
+    ref4 = Referral(review_id=review4.id, patient_id=p4.id, facility="Area Hospital Paderu", hospital_id=(_ph.id if _ph else None), specialty="Oral surgery / ENT",
                     priority="urgent", reason=review4.finding, status="CARE_LINKED", created_by=mo.id, created_at=now - timedelta(days=19))
     db.add(ref4)
     db.flush()

@@ -257,3 +257,20 @@ button[data-loading]{pointer-events:none;opacity:.85;cursor:progress}
 button[data-loading]::before{content:"";width:14px;height:14px;flex:none;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:btn-spin .7s linear infinite}
 @keyframes btn-spin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){button[data-loading]::before{animation-duration:1.6s}}
+
+/* ---- stage 11: geography, super admin ---- */
+.geo-filter{padding:14px 18px;margin:0 0 16px}
+.geo-filter .row>select{max-width:280px}
+tr.pick{cursor:pointer}
+tr.pick:hover td{background:var(--indigo-soft)}
+.geo-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.geo-head h3{margin:0}
+.mchips{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.mchip{display:inline-flex;align-items:center;gap:6px;padding:5px 6px 5px 12px;border-radius:8px;border:1.5px solid var(--line-2);background:#fff;font-size:13.5px;font-weight:600;color:var(--ink-2)}
+.mchip button{padding:2px 7px;font-size:12px;border-radius:6px;background:transparent;color:var(--muted);border-color:transparent}
+.mchip button:hover{background:var(--bad-soft);color:var(--bad);border-color:transparent}
+.mchip button.ed:hover{background:var(--indigo-soft);color:var(--indigo-d)}
+.json-edit{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;min-height:260px;white-space:pre}
+.cell-trunc{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.data-table td,.data-table th{white-space:nowrap}
+.suspend-note{background:var(--warn-soft);border-left:4px solid var(--turmeric);padding:10px 14px;border-radius:8px;font-size:14px;margin-top:12px}

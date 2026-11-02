@@ -48,6 +48,34 @@ def ensure_schema() -> None:
         conn.execute(text("ALTER TABLE ai_analyses ADD COLUMN IF NOT EXISTS feedback TEXT"))
         conn.execute(text("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS video_provider VARCHAR(20) DEFAULT 'google_meet'"))
         conn.execute(text("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS video_url VARCHAR(300)"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS district VARCHAR(120)"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS mandal VARCHAR(120)"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS suspension_reason VARCHAR(255)"))
+        conn.execute(text("ALTER TABLE patients ADD COLUMN IF NOT EXISTS district VARCHAR(120)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_users_district ON users (district)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_patients_district ON patients (district)"))
+        for col, typ in (
+            ("hospital_id", "VARCHAR(36)"), ("specialist_id", "VARCHAR(36)"), ("booked_by", "VARCHAR(36)"),
+            ("cross_mandal", "BOOLEAN DEFAULT FALSE"), ("cross_reason", "VARCHAR(255)"),
+            ("approval_status", "VARCHAR(20) DEFAULT 'NOT_REQUIRED'"), ("approval_note", "VARCHAR(255)"), ("decided_by", "VARCHAR(36)"),
+        ):
+            conn.execute(text(f"ALTER TABLE appointments ADD COLUMN IF NOT EXISTS {col} {typ}"))
+        for col, typ in (("hospital_id", "VARCHAR(36)"), ("specialty", "VARCHAR(80)"), ("phone", "VARCHAR(40)")):
+            conn.execute(text(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {typ}"))
+        for col in ("hospital_id", "specialist_id"):
+            conn.execute(text(f"ALTER TABLE referrals ADD COLUMN IF NOT EXISTS {col} VARCHAR(36)"))
+        conn.execute(text("ALTER TABLE referrals ADD COLUMN IF NOT EXISTS specialist_analysis TEXT"))
+        conn.execute(text("ALTER TABLE referrals ADD COLUMN IF NOT EXISTS analysis_outcome VARCHAR(40)"))
+        conn.execute(text("ALTER TABLE referrals ADD COLUMN IF NOT EXISTS analysed_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE notifications ADD COLUMN IF NOT EXISTS ref VARCHAR(80)"))
+        conn.execute(text("ALTER TABLE notifications ADD COLUMN IF NOT EXISTS kind VARCHAR(12) DEFAULT 'info'"))
+        conn.execute(text("ALTER TABLE notifications ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_notifications_ref ON notifications (ref)"))
+        conn.execute(text("UPDATE appointments SET approval_status = 'NOT_REQUIRED' WHERE approval_status IS NULL"))
+        conn.execute(text("UPDATE appointments SET cross_mandal = FALSE WHERE cross_mandal IS NULL"))
+        conn.execute(text("UPDATE notifications SET kind = 'info' WHERE kind IS NULL"))
+        conn.execute(text("UPDATE users SET role = 'medical_officer' WHERE role = 'health_officer'"))  # merged into one role
         conn.execute(text("UPDATE appointments SET video_provider = 'google_meet' WHERE video_provider IS NULL OR video_provider = 'jitsi'"))
 
 

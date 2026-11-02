@@ -9,7 +9,7 @@ export function Shell({ children }) {
   const nav = useNavigate();
   const [pending, setPending] = useState(0);
   useEffect(() => {
-    if (user?.role !== "admin") return undefined;
+    if (user?.role !== "admin" && user?.role !== "super_admin") return undefined;
     const load = () => api("/admin/users?status=pending").then((r) => setPending(r.length)).catch(() => {});
     load();
     window.addEventListener("pending-changed", load);
@@ -51,14 +51,12 @@ export function Shell({ children }) {
     medical_officer: [
       ["/reviews", t.reviews, "check"],
       ["/patients", t.patients, "users"],
+      ["/cross-mandal", "Cross-mandal requests", "check"],
       ["/audit", t.audit, "list"],
       ["/notifications", t.notifications, "bell"],
     ],
     specialist: [
-      ["/referrals", t.referrals, "file"],
-      ["/patients", t.patients, "users"],
-      ["/appointments", t.appointments, "cal"],
-      ["/investigations", t.investigations, "flask"],
+      ["/referrals", "My patients", "file"],
       ["/notifications", t.notifications, "bell"],
     ],
     navigator: [
@@ -72,10 +70,29 @@ export function Shell({ children }) {
       ["/admin/monitoring", "District monitoring", "chart"],
       ["/admin/pending", "Pending approvals", "check"],
       ["/admin/users", "Users", "users"],
+      ["/admin/geography", "Districts & mandals", "compass"],
+      ["/hospitals", "Hospitals", "compass"],
+      ["/specialists", "Specialists", "users"],
+      ["/audit", t.audit, "list"],
+      ["/notifications", t.notifications, "bell"],
+    ],
+    super_admin: [
+      ["/dashboard", t.dashboard, "chart"],
+      ["/admin/monitoring", "District monitoring", "chart"],
+      ["/admin/pending", "Pending approvals", "check"],
+      ["/admin/users", "Users", "users"],
+      ["/super/users", "Users & admins", "shield"],
+      ["/admin/geography", "Districts & mandals", "compass"],
+      ["/hospitals", "Hospitals", "compass"],
+      ["/specialists", "Specialists", "users"],
+      ["/cross-mandal", "Cross-mandal requests", "check"],
+      ["/super/data", "Data manager", "file"],
+      ["/patients", t.patients, "users"],
       ["/audit", t.audit, "list"],
       ["/notifications", t.notifications, "bell"],
     ],
   };
+  const roleLabel = { admin: "district admin", super_admin: "super admin" };
   const doLogout = () => {
     clearSession();
     nav("/login", { replace: true });
@@ -111,7 +128,7 @@ export function Shell({ children }) {
                 <span className="avatar">{initials(user.full_name)}</span>
                 <div>
                   <b>{user.full_name}</b>
-                  <span>{String(user.role).replace("_", " ")}</span>
+                  <span>{roleLabel[user.role] || String(user.role).replace("_", " ")}</span>
                 </div>
               </div>
             )}

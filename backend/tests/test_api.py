@@ -158,7 +158,7 @@ def test_consent_gate_and_journey():
     denied = client.get(f"/patients/{pid}", headers=spec)
     assert denied.status_code == 403
 
-    ref = client.post("/referrals", headers=mo, json={"review_id": review.json()["id"], "reason": "specialist exam"})
+    ref = client.post("/referrals", headers=mo, json={"review_id": review.json()["id"], "reason": "specialist exam", "hospital_id": client.get("/hospitals", headers=mo).json()[0]["id"]})
     assert ref.status_code == 200
     assert "te" in ref.json()["slip"]
     allowed = client.get(f"/patients/{pid}", headers=spec)
@@ -382,7 +382,7 @@ def test_ai_judges_quality_when_local_check_off(monkeypatch):
 
 
 def test_registration_requires_admin_approval():
-    body = {"full_name": "New Navigator", "email": "New.Nav@Example.com", "password": "Strong#123", "role": "navigator"}
+    body = {"full_name": "New Navigator", "email": "New.Nav@Example.com", "password": "Strong#123", "role": "navigator", "district": "Alluri Sitharama Raju", "mandal": "G. Madugula"}
     r = client.post("/auth/register", json=body)
     assert r.status_code == 201, r.text
 
@@ -417,7 +417,7 @@ def test_registration_requires_admin_approval():
 
 
 def test_rejected_registration_cannot_login():
-    client.post("/auth/register", json={"full_name": "Rej User", "email": "rej@example.com", "password": "Strong#123", "role": "specialist"})
+    client.post("/auth/register", json={"full_name": "Rej User", "email": "rej@example.com", "password": "Strong#123", "role": "navigator", "district": "Alluri Sitharama Raju", "mandal": "G. Madugula"})
     admin = auth("admin@demo.local")
     pending = client.get("/admin/users?status=pending", headers=admin).json()
     uid_ = next(u["id"] for u in pending if u["email"] == "rej@example.com")
@@ -570,3 +570,289 @@ def test_host_ends_or_deletes_call_and_alerts_roll_back():
     assert client.delete(f"/appointments/{bid}", headers=hw).status_code == 403  # health worker cannot delete
     assert client.delete(f"/appointments/{bid}", headers=spec).status_code == 200
     assert alerts_about(nav, bid) == [] and client.get(f"/appointments/{bid}", headers=spec).status_code == 404
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Stage 11: super admin, district / mandal lists, scoped dashboards, suspension
+# ----------------------------------------------------------------------------------------------------------------
+def _register_staff(email: str, role: str = "navigator", district="Alluri Sitharama Raju", mandal="G. Madugula"):
+    r = client.post("/auth/register", json={"full_name": "Staff " + email, "email": email, "password": "Strong#123", "role": role, "district": district, "mandal": mandal})
+    assert r.status_code == 201, r.text
+    admin = auth("admin@demo.local")
+    pending = client.get("/admin/users?status=pending", headers=admin).json()
+    uid_ = next(u["id"] for u in pending if u["email"] == email)
+    assert client.post(f"/admin/users/{uid_}/approve", headers=admin).status_code == 200
+    return uid_
+
+
+def test_geography_lists_and_registration_selection():
+    admin = auth("admin@demo.local")
+    # public list used by the sign-up page
+    geo = client.get("/geo").json()["districts"]
+    assert any(d["name"] == "Alluri Sitharama Raju" and any(m["name"] == "G. Madugula" for m in d["mandals"]) for d in geo)
+
+    # only admins may edit the list
+    assert client.post("/admin/geo/districts", json={"names": ["Nope"]}, headers=auth("hw@demo.local")).status_code == 403
+
+    r = client.post("/admin/geo/districts", json={"names": ["Test District A, Test District B\nTest District A"]}, headers=admin)
+    assert r.status_code == 201 and r.json()["added"] == ["Test District A", "Test District B"]
+    did = next(d["id"] for d in r.json()["districts"] if d["name"] == "Test District A")
+    m = client.post("/admin/geo/mandals", json={"district_id": did, "names": ["Mandal One, Mandal Two"]}, headers=admin)
+    assert m.status_code == 201 and len(m.json()["added"]) == 2
+    again = client.post("/admin/geo/mandals", json={"district_id": did, "names": ["mandal one"]}, headers=admin).json()
+    assert again["added"] == [] and again["skipped"] == ["mandal one"]
+
+    base = {"full_name": "Geo User", "email": "geo.user@example.com", "password": "Strong#123", "role": "navigator"}
+    assert client.post("/auth/register", json=base).status_code == 422  # district + mandal are required
+    assert client.post("/auth/register", json={**base, "district": "Test District A", "mandal": "G. Madugula"}).status_code == 422  # wrong district
+    assert client.post("/auth/register", json={**base, "district": "Test District A", "mandal": "Mandal Two"}).status_code == 201
+
+    # a mandal in use cannot be removed by a district admin; the unused one can
+    uid_ = next(u["id"] for u in client.get("/admin/users?status=pending", headers=admin).json() if u["email"] == "geo.user@example.com")
+    mandals = {x["name"]: x["id"] for d in client.get("/geo").json()["districts"] if d["id"] == did for x in d["mandals"]}
+    assert client.delete(f"/admin/geo/mandals/{mandals['Mandal Two']}", headers=admin).status_code == 409
+    assert client.delete(f"/admin/geo/mandals/{mandals['Mandal One']}", headers=admin).status_code == 200
+    assert client.post(f"/admin/users/{uid_}/reject", headers=admin).status_code == 200
+
+
+def test_patient_registration_carries_district_and_mandal():
+    hw = auth("hw@demo.local")
+    r = client.post("/patients", json={"full_name": "Geo Patient", "village": "G. Madugula", "district": "Alluri Sitharama Raju", "mandal": "G. Madugula"}, headers=hw)
+    assert r.status_code == 200 and r.json()["district"] == "Alluri Sitharama Raju" and r.json()["mandal"] == "G. Madugula"
+    # falls back to the health worker's own district / mandal when none is sent
+    r2 = client.post("/patients", json={"full_name": "Default Geo Patient"}, headers=hw)
+    assert r2.status_code == 200 and r2.json()["district"] == "Alluri Sitharama Raju"
+    bad = client.post("/patients", json={"full_name": "Bad Geo", "district": "Alluri Sitharama Raju", "mandal": "Nowhere"}, headers=hw)
+    assert bad.status_code == 422
+
+
+def test_district_and_mandal_dashboards_are_scoped():
+    admin = auth("admin@demo.local")
+    hw = auth("hw@demo.local")
+    client.post("/admin/geo/districts", json={"names": ["Scope District"]}, headers=admin)
+    did = next(d["id"] for d in client.get("/geo").json()["districts"] if d["name"] == "Scope District")
+    client.post("/admin/geo/mandals", json={"district_id": did, "names": ["Scope Mandal"]}, headers=admin)
+    # a patient registered in another district by someone who belongs there (super admin creates the staff member)
+    sup = auth("superadmin@demo.local")
+    created = client.post("/super/users", json={"full_name": "Scope HW", "email": "scope.hw@example.com", "password": "Strong#123", "role": "health_worker", "district": "Scope District", "mandal": "Scope Mandal"}, headers=sup)
+    assert created.status_code == 201, created.text
+    other = {"Authorization": "Bearer " + client.post("/auth/login", json={"email": "scope.hw@example.com", "password": "Strong#123"}).json()["token"]}
+    assert client.post("/patients", json={"full_name": "Scoped Patient"}, headers=other).status_code == 200
+
+    everything = client.get("/admin/monitoring", headers=admin).json()
+    scoped = client.get("/admin/monitoring?district=Scope%20District", headers=admin).json()
+    mandal = client.get("/admin/monitoring?district=Scope%20District&mandal=Scope%20Mandal", headers=admin).json()
+    nowhere = client.get("/admin/monitoring?district=Alluri%20Sitharama%20Raju&mandal=Nope", headers=admin).json()
+    assert scoped["funnel"][0]["value"] == 1 and mandal["funnel"][0]["value"] == 1 and nowhere["funnel"][0]["value"] == 0
+    assert everything["funnel"][0]["value"] > scoped["funnel"][0]["value"]
+    assert scoped["scope"]["level"] == "district" and mandal["scope"]["level"] == "mandal"
+    assert {r["area"] for r in everything["by_district"]} >= {"Alluri Sitharama Raju", "Scope District"}
+    assert client.get("/dashboard/summary?district=Scope%20District", headers=admin).json()["screenings"] == 0
+    assert client.get("/admin/monitoring", headers=hw).status_code == 403
+
+
+def test_district_admin_can_suspend_and_reactivate_without_losing_data():
+    admin = auth("admin@demo.local")
+    uid_ = _register_staff("suspend.me@example.com", "health_worker")
+    login = lambda: client.post("/auth/login", json={"email": "suspend.me@example.com", "password": "Strong#123"})
+    token = login().json()["token"]
+    mine = {"Authorization": f"Bearer {token}"}
+    p = client.post("/patients", json={"full_name": "Kept Patient"}, headers=mine)
+    assert p.status_code == 200
+
+    s = client.post(f"/admin/users/{uid_}/suspend", json={"reason": "left the programme"}, headers=admin)
+    assert s.status_code == 200 and s.json()["status"] == "suspended" and s.json()["suspension_reason"] == "left the programme"
+    assert login().status_code == 403                                   # cannot sign in
+    assert client.get("/auth/me", headers=mine).status_code == 401       # existing session is cut off at once
+    assert client.post(f"/admin/users/{uid_}/suspend", headers=admin).status_code == 409  # already suspended
+
+    detail = client.get(f"/admin/users/{uid_}", headers=admin).json()    # the account and its history are still there
+    assert detail["user"]["status"] == "suspended" and detail["work"]["metrics"]["patients_registered"] == 1
+    assert uid_ in {u["id"] for u in client.get("/admin/users?status=suspended", headers=admin).json()}
+
+    assert client.post(f"/admin/users/{uid_}/reactivate", headers=admin).status_code == 200
+    assert login().status_code == 200
+    assert client.get("/auth/me", headers=mine).status_code == 200
+
+    # guard rails: not yourself, not other admins, not outside the admin roles
+    me = client.get("/auth/me", headers=admin).json()["id"]
+    assert client.post(f"/admin/users/{me}/suspend", headers=admin).status_code == 404  # admins are not manageable by a district admin
+    assert client.post(f"/admin/users/{uid_}/suspend", headers=auth("hw@demo.local")).status_code == 403
+
+
+def test_super_admin_privileges():
+    sup = auth("superadmin@demo.local")
+    admin = auth("admin@demo.local")
+
+    # sees everything a district admin sees ...
+    assert client.get("/dashboard/summary", headers=sup).status_code == 200
+    assert client.get("/admin/monitoring", headers=sup).status_code == 200
+    assert client.get("/audit", headers=sup).status_code == 200
+    assert client.get("/patients", headers=sup).status_code == 200      # ... plus identifiable records
+    # ... but a district admin cannot use the super admin console
+    assert client.get("/super/data", headers=admin).status_code == 403
+    assert client.post("/super/users", json={"full_name": "X Y", "email": "x@y.com", "password": "Strong#123", "role": "admin"}, headers=admin).status_code == 403
+
+    # adds a district admin manually; the new admin can sign in immediately
+    r = client.post("/super/users", json={"full_name": "New District Admin", "email": "new.admin@example.com", "password": "Strong#123", "role": "admin"}, headers=sup)
+    assert r.status_code == 201 and r.json()["status"] == "active" and r.json()["role"] == "admin"
+    assert client.post("/auth/login", json={"email": "new.admin@example.com", "password": "Strong#123"}).status_code == 200
+    assert client.post("/super/users", json={"full_name": "Dup", "email": "NEW.admin@example.com", "password": "Strong#123", "role": "admin"}, headers=sup).status_code == 409
+    new_id = r.json()["id"]
+    listed = {u["id"] for u in client.get("/admin/users", headers=sup).json()}
+    assert new_id in listed and new_id not in {u["id"] for u in client.get("/admin/users", headers=admin).json()}
+
+    # alters any account, resets a password, suspends an admin
+    assert client.patch(f"/super/users/{new_id}", json={"full_name": "Renamed Admin", "password": "Another#123"}, headers=sup).json()["full_name"] == "Renamed Admin"
+    assert client.post("/auth/login", json={"email": "new.admin@example.com", "password": "Another#123"}).status_code == 200
+    assert client.post(f"/admin/users/{new_id}/suspend", headers=sup).status_code == 200
+    assert client.post("/auth/login", json={"email": "new.admin@example.com", "password": "Another#123"}).status_code == 403
+
+    # cannot lock the application out of super admins
+    me = client.get("/auth/me", headers=sup).json()["id"]
+    assert client.delete(f"/super/users/{me}", headers=sup).status_code == 400
+    assert client.patch(f"/super/users/{me}", json={"role": "admin"}, headers=sup).status_code == 400
+
+    # deletes an account for good
+    assert client.delete(f"/super/users/{new_id}", headers=sup).status_code == 200
+    assert new_id not in {u["id"] for u in client.get("/admin/users", headers=sup).json()}
+
+
+def test_super_admin_data_manager_can_add_alter_and_delete_any_row():
+    sup = auth("superadmin@demo.local")
+    tables = {t["table"]: t for t in client.get("/super/data", headers=sup).json()}
+    assert {"users", "patients", "screenings", "referrals", "districts", "mandals"} <= set(tables)
+    assert all(c["name"] != "password_hash" for c in tables["users"]["columns"])  # hashes are never exposed
+
+    created = client.post("/super/data/patients", json={"data": {"full_name": "Manual Patient", "district": "Alluri Sitharama Raju", "mandal": "G. Madugula", "age": "52"}}, headers=sup)
+    assert created.status_code == 201 and created.json()["age"] == 52
+    pid = created.json()["id"]
+    upd = client.patch(f"/super/data/patients/{pid}", json={"data": {"full_name": "Edited Patient", "phone": "9111111111"}}, headers=sup)
+    assert upd.status_code == 200 and upd.json()["full_name"] == "Edited Patient"
+    found = client.get("/super/data/patients?q=Edited", headers=sup).json()
+    assert found["total"] >= 1 and any(r["id"] == pid for r in found["rows"])
+
+    # a row with dependants is refused until cascade is requested
+    hw = auth("hw@demo.local")
+    victim = client.post("/patients", json={"full_name": "Cascade Victim"}, headers=hw).json()["id"]
+    assert client.post("/patients/%s/consents" % victim, json={"purpose": "examination", "language": "en", "granted": True}, headers=hw).status_code == 200
+    assert client.delete(f"/super/data/patients/{victim}", headers=sup).status_code == 409
+    assert client.delete(f"/super/data/patients/{victim}?cascade=true", headers=sup).status_code == 200
+    assert client.get(f"/super/data/patients?q=Cascade%20Victim", headers=sup).json()["total"] == 0
+
+    assert client.delete(f"/super/data/patients/{pid}", headers=sup).status_code == 200
+    assert client.delete(f"/super/data/patients/{pid}", headers=sup).status_code == 404
+    assert client.get("/super/data/not_a_table", headers=sup).status_code == 404
+    assert client.get("/super/data/audit_events?q=superadmin.data", headers=sup).json()["total"] >= 3  # every change is audited
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Stage 12: hospitals, patient's hospital choice, cross-mandal approval, self-clearing notifications
+# ----------------------------------------------------------------------------------------------------------------
+def test_hospitals_booking_cross_mandal_and_notification_clearing():
+    from app.seed import seed_demo_pipeline
+
+    db = SessionLocal()
+    try:
+        seed_demo_pipeline(db)
+    finally:
+        db.close()
+    ho, nav, spec = auth("mo@demo.local"), auth("nav@demo.local"), auth("spec@demo.local")
+    asr = "Alluri Sitharama Raju"
+
+    # only a district admin (or super admin) adds hospitals; the medical officer cannot
+    adm = auth("admin@demo.local")
+    assert client.post("/hospitals", json={"name": "MO Not Allowed", "district": asr, "mandal": "G. Madugula"}, headers=ho).status_code == 403
+    # (original comment) only an admin adds hospitals; duplicates are refused
+    body = {"name": "Test Mandal Hospital", "district": asr, "mandal": "G. Madugula", "contact_phone": "08935-111111"}
+    assert client.post("/hospitals", json=body, headers=nav).status_code == 403
+    made = client.post("/hospitals", json=body, headers=adm)
+    assert made.status_code == 201, made.text
+    assert client.post("/hospitals", json=body, headers=adm).status_code == 409
+    hid = made.json()["id"]
+
+    # booking form: hospitals of a mandal
+    local = client.get("/hospitals", params={"district": asr, "mandal": "G. Madugula"}, headers=nav).json()
+    assert any(h["id"] == hid for h in local)
+    paderu = client.get("/hospitals", params={"district": asr, "mandal": "Paderu"}, headers=nav).json()
+    assert paderu, "demo seed has a hospital in Paderu"
+
+    ref = next(r for r in client.get("/referrals", headers=spec).json() if "Appa Rao" in (r["patient_name"] or ""))
+    slot = "2030-02-01T10:00:00+05:30"
+
+    # a hospital visit needs a hospital
+    assert client.post("/appointments", headers=nav, json={"referral_id": ref["id"], "kind": "physical", "slot": slot}).status_code == 422
+
+    # same mandal: booked straight away
+    ok = client.post("/appointments", headers=nav, json={"referral_id": ref["id"], "kind": "physical", "slot": slot, "status": "CONFIRMED", "hospital_id": hid})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["approval_status"] == "NOT_REQUIRED" and ok.json()["hospital_name"] == "Test Mandal Hospital"
+
+    # a plain alert is cleared as soon as it is acted on
+    notes = client.get("/notifications", headers=spec).json()
+    plain = next(n for n in notes if "Hospital appointment scheduled" in n["title"] and f"[appt:{ok.json()['id']}]" in n["body"])
+    assert plain["kind"] == "info"
+    assert client.patch(f"/notifications/{plain['id']}", headers=spec).json()["cleared"] is True
+    assert all(n["id"] != plain["id"] for n in client.get("/notifications", headers=spec).json())
+
+    # other mandal: needs a reason and a medical officer's acceptance
+    cross = {"referral_id": ref["id"], "kind": "physical", "slot": slot, "status": "CONFIRMED", "hospital_id": paderu[0]["id"]}
+    assert client.post("/appointments", headers=nav, json=cross).status_code == 422
+    req = client.post("/appointments", headers=nav, json={**cross, "cross_reason": "Only oral surgery unit within reach"})
+    assert req.status_code == 200, req.text
+    rid = req.json()["id"]
+    assert req.json()["status"] == "PENDING_APPROVAL" and req.json()["approval_status"] == "PENDING"
+    assert client.patch(f"/appointments/{rid}", headers=nav, json={"status": "CONFIRMED"}).status_code == 409  # cannot skip the officer
+
+    pending = client.get("/cross-mandal-requests", headers=ho).json()
+    assert any(r["id"] == rid and "patient_name" not in r for r in pending)
+    assert client.get("/cross-mandal-requests", headers=nav).status_code == 403
+    officer_note = next(n for n in client.get("/notifications", headers=ho).json() if f"[xmandal:{rid}]" in n["body"])
+    assert officer_note["action_pending"] is True
+    client.patch(f"/notifications/{officer_note['id']}", headers=ho)  # opening it does not clear it: no decision yet
+    assert any(n["id"] == officer_note["id"] for n in client.get("/notifications", headers=ho).json())
+
+    assert client.post(f"/appointments/{rid}/cross-mandal/decision", headers=nav, json={"decision": "approve"}).status_code == 403
+    done = client.post(f"/appointments/{rid}/cross-mandal/decision", headers=ho, json={"decision": "approve", "note": "Accepted"})
+    assert done.status_code == 200 and done.json()["approval_status"] == "APPROVED" and done.json()["status"] == "CONFIRMED"
+    assert all(f"[xmandal:{rid}]" not in n["body"] for n in client.get("/notifications", headers=ho).json())  # answered -> cleared
+    assert client.post(f"/appointments/{rid}/cross-mandal/decision", headers=ho, json={"decision": "approve"}).status_code == 409
+
+    # declining needs a reason and cancels the booking
+    req2 = client.post("/appointments", headers=nav, json={**cross, "cross_reason": "Patient prefers this town"}).json()
+    assert client.post(f"/appointments/{req2['id']}/cross-mandal/decision", headers=ho, json={"decision": "reject"}).status_code == 422
+    no = client.post(f"/appointments/{req2['id']}/cross-mandal/decision", headers=ho, json={"decision": "reject", "note": "Use the local hospital"})
+    assert no.json()["approval_status"] == "REJECTED" and no.json()["status"] == "CANCELLED"
+
+    # a medical officer cannot approve a request they booked themselves
+    own = client.post("/appointments", headers=ho, json={**cross, "cross_reason": "Own request for test"}).json()
+    assert client.post(f"/appointments/{own['id']}/cross-mandal/decision", headers=ho, json={"decision": "approve"}).status_code == 403
+    assert client.post(f"/appointments/{own['id']}/cross-mandal/decision", headers=auth("superadmin@demo.local"), json={"decision": "approve"}).status_code == 200
+
+    # hospitals with appointments cannot be deleted, only hidden
+    assert client.delete(f"/hospitals/{hid}", headers=adm).status_code == 409
+    assert client.patch(f"/hospitals/{hid}", headers=adm, json={"available": False}).status_code == 200
+    assert all(h["id"] != hid for h in client.get("/hospitals", params={"district": asr, "mandal": "G. Madugula"}, headers=nav).json())
+    assert client.post("/appointments", headers=nav, json={"referral_id": ref["id"], "kind": "physical", "slot": slot, "hospital_id": hid}).status_code == 422
+
+
+def test_meet_alerts_stay_until_their_day_is_over():
+    from app.seed import seed_demo_pipeline
+
+    db = SessionLocal()
+    try:
+        seed_demo_pipeline(db)
+    finally:
+        db.close()
+    spec, nav = auth("spec@demo.local"), auth("nav@demo.local")
+    ref = next(r for r in client.get("/referrals", headers=spec).json() if "Appa Rao" in (r["patient_name"] or ""))
+    meet = {"referral_id": ref["id"], "kind": "video", "status": "CONFIRMED", "meet_url": "https://meet.google.com/abc-defg-hij"}
+
+    future = client.post("/appointments", headers=spec, json={**meet, "slot": "2030-03-01T10:00:00+05:30"}).json()
+    note = next(n for n in client.get("/notifications", headers=nav).json() if f"[appt:{future['id']}]" in n["body"])
+    assert note["kind"] == "meet" and note["expires_at"].startswith("2030-03-01")
+    assert client.patch(f"/notifications/{note['id']}", headers=nav).json()["cleared"] is False  # opening it keeps the link
+    assert any(n["id"] == note["id"] for n in client.get("/notifications", headers=nav).json())
+
+    past = client.post("/appointments", headers=spec, json={**meet, "slot": "2020-03-01T10:00:00+05:30"}).json()
+    assert all(f"[appt:{past['id']}]" not in n["body"] for n in client.get("/notifications", headers=nav).json())  # day is over -> gone

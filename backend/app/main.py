@@ -5,7 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .db import Base, SessionLocal, engine, ensure_schema
+from .admin_routes import router as admin_router
 from .routers import router
+from .hospital_routes import router as hospital_router
 from .seed import seed_if_empty
 from . import supabase_storage
 
@@ -40,3 +42,5 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(admin_router)
+app.include_router(hospital_router)
