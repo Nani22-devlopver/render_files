@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from .access import audit, clear_notifications, notify
 from .db import get_db
 from .geo import clean, validate_geo
+from .access import same_area, user_area
 from .models import Appointment, Hospital, Notification, Patient, Referral, Screening, ClinicalReview, User
 from .security import hash_password
 from .routers import appointment_out, fmt_slot, notify_appointment
@@ -239,6 +240,10 @@ def list_specialists(
         q = q.filter(User.hospital_id == hospital_id)
     hospitals = _hospital_map(db)
     rows = [u for u in q.order_by(User.full_name).all()]
+    # Medical officers / navigators get their own mandal's specialists by default. Naming a hospital, district or
+    # mandal explicitly (cross-mandal / cross-district booking) still returns that place's specialists.
+    if user.role in {"medical_officer", "navigator"} and not (hospital_id or clean(district) or clean(mandal)) and any(user_area(user)):
+        rows = [u for u in rows if u.hospital_id in hospitals and same_area(user, hospitals[u.hospital_id].district, hospitals[u.hospital_id].mandal)]
     if clean(district) or clean(mandal):
         rows = [
             u for u in rows
@@ -353,12 +358,13 @@ def _request_out(db: Session, a: Appointment) -> dict:
 
 
 def _in_officer_scope(user: User, a: Appointment, db: Session) -> bool:
-    if user.role == "super_admin" or not user.district:
+    if user.role == "super_admin" or not (user.district or user.mandal):
         return True
     h = db.get(Hospital, a.hospital_id) if a.hospital_id else None
     ref = db.get(Referral, a.referral_id)
     p = db.get(Patient, ref.patient_id) if ref else None
-    return user.district in {h.district if h else None, p.district if p else None}
+    # a medical officer decides requests whose patient mandal or requested hospital mandal is their own
+    return any(same_area(user, x.district, x.mandal) for x in (h, p) if x is not None)
 
 
 @router.get("/cross-mandal-requests")
@@ -376,7 +382,7 @@ def decide_cross_mandal(appointment_id: str, body: DecisionIn, db: Session = Dep
     if not a or not a.cross_mandal:
         raise HTTPException(404, "Cross-mandal request not found")
     if not _in_officer_scope(user, a, db):
-        raise HTTPException(403, "This request belongs to another district")
+        raise HTTPException(403, "This request belongs to another mandal")
     if a.booked_by and a.booked_by == user.id:
         raise HTTPException(403, "You booked this request yourself. Another medical officer must decide it")
     if a.approval_status != "PENDING":

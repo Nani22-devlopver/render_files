@@ -1,10 +1,96 @@
 from fastapi import HTTPException
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
-from .models import Patient, Referral, Screening, User
+from .models import Appointment, Hospital, Patient, Referral, Screening, User
 
 
 CLINICAL_ROLES = {"health_worker", "medical_officer", "specialist", "navigator"}
+
+
+# ---------- mandal / district data segregation ----------
+# Health workers, medical officers and navigators only work with data of their own district + mandal.
+# Specialists are scoped by their hospital (see specialist_referral_filter). Admins / super admins are never scoped here.
+# Cross-mandal / cross-district bookings are the single exception and go through the medical officer's decision.
+GEO_SCOPED_ROLES = {"health_worker", "medical_officer", "navigator"}
+
+
+def _norm(v: str | None) -> str:
+    return (v or "").strip().lower()
+
+
+def user_area(user: User) -> tuple[str, str]:
+    return _norm(user.district), _norm(user.mandal)
+
+
+def same_area(user: User, district: str | None, mandal: str | None) -> bool:
+    """True when (district, mandal) lies inside the user's own area. A user with no area configured is not restricted."""
+    ud, um = user_area(user)
+    if ud and _norm(district) != ud:
+        return False
+    if um and _norm(mandal) != um:
+        return False
+    return True
+
+
+def geo_scoped(user: User) -> bool:
+    return user.role in GEO_SCOPED_ROLES and any(user_area(user))
+
+
+def patient_area_clause(user: User):
+    """SQL condition on Patient for the user's own district / mandal (None when the user is not scoped)."""
+    if not geo_scoped(user):
+        return None
+    ud, um = user_area(user)
+    conds = []
+    if ud:
+        conds.append(func.lower(func.trim(Patient.district)) == ud)
+    if um:
+        conds.append(func.lower(func.trim(Patient.mandal)) == um)
+    return and_(*conds)
+
+
+def hospital_area_clause(user: User):
+    ud, um = user_area(user)
+    conds = []
+    if ud:
+        conds.append(func.lower(func.trim(Hospital.district)) == ud)
+    if um:
+        conds.append(func.lower(func.trim(Hospital.mandal)) == um)
+    return and_(*conds) if conds else None
+
+
+def referral_area_clause(user: User):
+    """SQL condition on Referral: patient lives in the user's area (navigators also see referrals into a hospital of their area)."""
+    pc = patient_area_clause(user)
+    if pc is None:
+        return None
+    clause = Referral.patient_id.in_(select(Patient.id).where(pc))
+    if user.role == "navigator":
+        hc = hospital_area_clause(user)
+        if hc is not None:
+            clause = clause | Referral.hospital_id.in_(select(Hospital.id).where(hc))
+    return clause
+
+
+def referral_in_area(db: Session, user: User, r: Referral) -> bool:
+    clause = referral_area_clause(user)
+    if clause is None:
+        return True
+    return db.query(Referral.id).filter(Referral.id == r.id, clause).first() is not None
+
+
+def appointment_in_area(db: Session, user: User, a: Appointment) -> bool:
+    if not geo_scoped(user):
+        return True
+    ref = db.get(Referral, a.referral_id)
+    return bool(ref) and referral_in_area(db, user, ref)
+
+
+def users_in_area(db: Session, role: str, *places: tuple[str | None, str | None]) -> list[User]:
+    """Active users of `role` whose own area contains at least one of the given (district, mandal) places."""
+    rows = db.query(User).filter(User.role == role, User.status == "active").all()
+    return [u for u in rows if not any(user_area(u)) or any(same_area(u, d, m) for d, m in places)]
 
 
 def audit(db: Session, actor_id: str | None, event: str, resource: str, meta: str | None = None):
@@ -44,9 +130,9 @@ def specialist_referral_filter(user: User):
     return or_(own, and_(Referral.specialist_id.is_(None), Referral.hospital_id == user.hospital_id))
 
 
-def referral_visible(user: User, r: Referral) -> bool:
+def referral_visible(user: User, r: Referral, db: Session | None = None) -> bool:
     if user.role != "specialist":
-        return True
+        return referral_in_area(db, user, r) if db is not None else True
     return r.specialist_id == user.id or (r.specialist_id is None and bool(user.hospital_id) and r.hospital_id == user.hospital_id)
 
 
@@ -55,10 +141,8 @@ def patient_visible(user: User, patient: Patient) -> bool:
         return True
     if user.role == "admin":
         return False
-    if user.role == "health_worker":
-        return patient.facility == user.assigned_facility
-    if user.role == "medical_officer":
-        return patient.facility == user.assigned_facility
+    if user.role in {"health_worker", "medical_officer"}:
+        return patient.facility == user.assigned_facility and same_area(user, patient.district, patient.mandal)
     if user.role in {"specialist", "navigator"}:
         return True
     return False
@@ -80,6 +164,10 @@ def assert_patient_access(user: User, patient: Patient, db: Session | None = Non
         q = db.query(Referral).filter(Referral.patient_id == patient.id) if db else None
         if q is not None and user.role == "specialist":
             q = q.filter(specialist_referral_filter(user))
+        if q is not None and user.role == "navigator":
+            rc = referral_area_clause(user)
+            if rc is not None:
+                q = q.filter(rc)
         if q is None or not q.first():
             raise HTTPException(403, "Access is limited to cases referred to you" if user.role == "specialist" else "Access is limited to referred cases")
         return
